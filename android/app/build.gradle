@@ -3,7 +3,9 @@ def releaseKeystore = providers.environmentVariable('ANDROID_KEYSTORE_PATH').orN
 android {
     namespace 'com.local.huaweicast'
     compileSdk 36
-    defaultConfig { applicationId 'com.local.huaweicast'; minSdk 29; targetSdk 35; versionCode 7; versionName '1.6.0-experimental' }
+    ndkVersion '28.2.13676358'
+    defaultConfig { applicationId 'com.local.huaweicast'; minSdk 29; targetSdk 35; versionCode 10; versionName '1.6.0-beta.3' }
+    externalNativeBuild { cmake { path file('src/main/cpp/CMakeLists.txt'); version '3.22.1' } }
     compileOptions { coreLibraryDesugaringEnabled true; sourceCompatibility JavaVersion.VERSION_17; targetCompatibility JavaVersion.VERSION_17 }
     if (releaseKeystore != null) {
         signingConfigs {
@@ -18,9 +20,19 @@ android {
     }
     sourceSets.main.assets.srcDir(layout.buildDirectory.dir('generated/licenseAssets').get().asFile)
 }
+def packageFdkSource = tasks.register('packageFdkSource', Zip) {
+    from(rootProject.file('../third_party/fdk-aac'))
+    archiveFileName = 'fdk-aac-2.0.3-source.zip'
+    destinationDirectory = layout.buildDirectory.dir('generated/fdkSource')
+    preserveFileTimestamps = false
+    reproducibleFileOrder = true
+}
 def prepareLicenseAssets = tasks.register('prepareLicenseAssets', Sync) {
+    dependsOn(packageFdkSource)
     from(rootProject.file('../LICENSE'))
-    from(rootProject.file('../third_party'))
+    from(rootProject.file('../third_party')) { exclude 'fdk-aac/**' }
+    from(rootProject.file('../third_party/fdk-aac/NOTICE')) { rename { 'FDK-AAC-LICENSE' } }
+    from(packageFdkSource.flatMap { it.archiveFile })
     into(layout.buildDirectory.dir('generated/licenseAssets/licenses'))
 }
 tasks.named('preBuild').configure { dependsOn(prepareLicenseAssets) }

@@ -17,6 +17,8 @@
 
 私钥仅在发布 job 中还原到 runner 临时目录，任务结束时删除。APK 内包含完整第三方许可文本，Release 同时附带许可声明和 SHA-256 校验文件。
 
+兼容镜像音频使用原生 FDK-AAC 编码器，构建固定使用 NDK `28.2.13676358` 和 CMake `3.22.1`。工作流会安装这两个组件。APK 的 `assets/licenses` 同时包含 FDK 的完整许可和完整源码压缩包；发布时不要删除这些材料。FDK 软件许可不包含 AAC 专利许可。
+
 ## 发布新版本
 
 1. 修改 `android/app/build.gradle` 中的 `versionName` 和递增的 `versionCode`。

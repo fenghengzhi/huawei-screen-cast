@@ -3,12 +3,15 @@ package com.local.huaweicast;
 import java.io.*;
 import java.net.*;
 import java.nio.charset.StandardCharsets;
-import java.security.SecureRandom;
+import java.util.HashMap;
+import java.util.Locale;
+import java.util.Map;
+import java.util.Set;
 import java.util.concurrent.*;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.function.Consumer;
 
-/** Experimental legacy AirPlay transport, not a proprietary Lelink implementation. */
+/** Legacy AirPlay compatibility transport, not a proprietary Lelink implementation. */
 public final class LegacyMirrorClient implements AutoCloseable {
     public interface Binder {
         void bind(Socket socket) throws IOException;
@@ -18,98 +21,166 @@ public final class LegacyMirrorClient implements AutoCloseable {
         Socket createSocket() throws IOException;
         DatagramSocket createDatagramSocket() throws IOException;
     }
-    private record Frame(byte[] data, long pts, boolean key) {}
+    private record CodecConfig(int width, int height, byte[] sps, byte[] pps, long generation) {}
+    private record Frame(byte[] data, long pts, boolean key, long queuedNs, CodecConfig config) {}
+    private static final long MAX_QUEUE_AGE_NS = TimeUnit.MILLISECONDS.toNanos(500);
     private final ArrayBlockingQueue<Frame> frames = new ArrayBlockingQueue<>(8);
+    private final Object frameLock = new Object();
+    private final Set<Thread> ioThreads = ConcurrentHashMap.newKeySet();
     private final Consumer<String> failure;
     private final Runnable requestKey;
-    private final int width, height;
+    private int width, height;
     private final SocketFactory socketFactory;
+    private final LegacyMirrorSession sharedSession;
+    private final int latencyMs;
+    private final boolean companionAudio;
     private final AtomicBoolean closed = new AtomicBoolean(), connectionStarted = new AtomicBoolean();
-    private volatile boolean waitingKey = true;
-    private volatile byte[] sps, pps;
+    private boolean waitingKey = true;
+    private CodecConfig configuration;
+    private volatile long formatGeneration;
     private volatile Socket socket;
     private volatile DatagramSocket timing;
     private final ScheduledExecutorService watchdog = Executors.newSingleThreadScheduledExecutor();
     private volatile long lastWriteNs = System.nanoTime(), sentFrames, timingReplies;
     private long epochNs;
     public LegacyMirrorClient(int width, int height, Runnable requestKey, Consumer<String> failure) {
-        this(width, height, requestKey, failure, new SocketFactory() {
+        this(width, height, requestKey, failure, null, 90);
+    }
+    public LegacyMirrorClient(int width, int height, Runnable requestKey, Consumer<String> failure,
+                              LegacyMirrorSession session, int latencyMs) {
+        this(width, height, requestKey, failure, session, latencyMs, false);
+    }
+    public LegacyMirrorClient(int width, int height, Runnable requestKey, Consumer<String> failure,
+                              LegacyMirrorSession session, int latencyMs, boolean companionAudio) {
+        this(width, height, requestKey, failure, session, latencyMs, companionAudio, new SocketFactory() {
             @Override public Socket createSocket() { return new Socket(); }
             @Override public DatagramSocket createDatagramSocket() throws SocketException { return new DatagramSocket(null); }
         });
     }
     LegacyMirrorClient(int width, int height, Runnable requestKey, Consumer<String> failure, SocketFactory socketFactory) {
+        this(width, height, requestKey, failure, null, 90, socketFactory);
+    }
+    LegacyMirrorClient(int width, int height, Runnable requestKey, Consumer<String> failure,
+                      LegacyMirrorSession session, int latencyMs, SocketFactory socketFactory) {
+        this(width, height, requestKey, failure, session, latencyMs, false, socketFactory);
+    }
+    LegacyMirrorClient(int width, int height, Runnable requestKey, Consumer<String> failure,
+                      LegacyMirrorSession session, int latencyMs, boolean companionAudio, SocketFactory socketFactory) {
+        validateDimensions(width, height);
+        if (latencyMs < 0 || latencyMs > 5000) throw new IllegalArgumentException("Invalid mirror latency");
+        if (companionAudio && session == null) throw new IllegalArgumentException("Missing shared audio session");
         this.width = width; this.height = height; this.requestKey = requestKey; this.failure = failure;
         this.socketFactory = socketFactory;
+        this.sharedSession = session; this.latencyMs = latencyMs;
+        this.companionAudio = companionAudio;
     }
     public long sentFrames() { return sentFrames; }
     public long timingReplies() { return timingReplies; }
-    public void configure(byte[] sps, byte[] pps) { this.sps = sps.clone(); this.pps = pps.clone(); }
-    public void offer(byte[] data, long monotonicUs, boolean key) {
-        if (closed.get()) return;
-        if (data.length > 2 * 1024 * 1024) { frames.clear(); waitingKey = true; requestKey.run(); return; }
-        if (waitingKey && !key) return;
-        if (key) waitingKey = false;
-        if (!frames.offer(new Frame(data, monotonicUs, key))) {
-            frames.clear(); waitingKey = true; requestKey.run();
+    public void configure(byte[] sps, byte[] pps) {
+        synchronized (frameLock) {
+            if (!closed.get()) configuration = new CodecConfig(width, height, sps.clone(), pps.clone(), formatGeneration);
         }
     }
+    /** Call after stopping the old encoder and before starting its replacement. The connection and clock stay intact. */
+    public void resize(int width, int height) {
+        validateDimensions(width, height);
+        synchronized (frameLock) {
+            if (closed.get()) return;
+            this.width = width; this.height = height; formatGeneration++;
+            configuration = null; frames.clear(); waitingKey = true;
+        }
+    }
+    private static void validateDimensions(int width, int height) {
+        if (width < 1 || height < 1 || width > 16384 || height > 16384) throw new IllegalArgumentException("Invalid mirror dimensions");
+    }
+    public void offer(byte[] data, long monotonicUs, boolean key) {
+        boolean recover = false;
+        synchronized (frameLock) {
+            if (closed.get() || configuration == null) return;
+            if (data.length > 2 * 1024 * 1024) recover = true;
+            else if (waitingKey && !key) return;
+            else {
+                if (key) waitingKey = false;
+                recover = !frames.offer(new Frame(data, monotonicUs, key, System.nanoTime(), configuration));
+            }
+            if (recover) { frames.clear(); waitingKey = true; }
+        }
+        if (recover) requestKey.run();
+    }
+    private void recoverQueue(long generation) {
+        synchronized (frameLock) {
+            if (closed.get() || generation != formatGeneration) return;
+            frames.clear(); waitingKey = true;
+        }
+        requestKey.run();
+    }
     public void connect(LelinkEndpoint endpoint, Binder binder) throws Exception {
-        if (!connectionStarted.compareAndSet(false, true)) throw new IOException("实验连接已启动");
+        if (!connectionStarted.compareAndSet(false, true)) throw new IOException("兼容镜像连接已启动");
         try { connectOnce(endpoint, binder); }
         catch (Exception error) { close(); throw error; }
     }
     private void connectOnce(LelinkEndpoint endpoint, Binder binder) throws Exception {
-        if (closed.get()) throw new IOException("实验已取消");
+        if (closed.get()) throw new IOException("兼容镜像已取消");
         if (endpoint.mirrorPort().isEmpty()) throw new IOException("未广播镜像端口");
-        epochNs = System.nanoTime();
+        LegacyMirrorSession session = sharedSession == null ? LegacyMirrorSession.create() : sharedSession;
+        epochNs = session.epochNs();
         DatagramSocket udp = socketFactory.createDatagramSocket(); timing = udp;
-        if (closed.get()) { udp.close(); throw new IOException("实验已取消"); }
+        if (closed.get()) { udp.close(); throw new IOException("兼容镜像已取消"); }
         binder.bind(udp); udp.bind(new InetSocketAddress(7010)); udp.setSoTimeout(1000);
         Socket tcp = socketFactory.createSocket(); socket = tcp;
-        if (closed.get()) { tcp.close(); throw new IOException("实验已取消"); }
+        if (closed.get()) { tcp.close(); throw new IOException("兼容镜像已取消"); }
         binder.bind(tcp); tcp.connect(new InetSocketAddress(endpoint.address(), endpoint.mirrorPort().getAsInt()), 2500);
         tcp.setTcpNoDelay(true); tcp.setSoTimeout(1000);
-        SecureRandom random = new SecureRandom();
-        long id = (random.nextLong() & 0x0000ffffffffffffL) | 0x020000000000L;
-        byte[] info = LegacyMirrorWire.streamInfo(id, random.nextInt() & 0x7fffffffL, 90);
+        long id = session.deviceId();
+        // In the PC compatibility profile GET establishes the session; G2's POST parser does not consume a body.
+        byte[] info = companionAudio ? new byte[0] : LegacyMirrorWire.streamInfo(id, session.sessionId(), latencyMs);
         String host = endpoint.address().getHostAddress();
         if (host.contains(":")) host = "[" + host + "]";
+        // This compatibility profile is explicitly plaintext; our own product name remains in the UA.
+        String userAgent = companionAudio ? "AirParrot/1.1 HuaweiCast/1.0" : "HuaweiCast-Experimental/1.0";
         String header = "POST /stream HTTP/1.1\r\nHost: " + host + ":" + endpoint.mirrorPort().getAsInt()
-            + "\r\nUser-Agent: HuaweiCast-Experimental/1.0\r\nX-Apple-Device-ID: 0x" + Long.toHexString(id)
-            + "\r\nContent-Type: application/x-apple-binary-plist\r\nContent-Length: " + info.length + "\r\n\r\n";
+            + "\r\nUser-Agent: " + userAgent + "\r\nX-Apple-Device-ID: 0x" + Long.toHexString(id)
+            + (info.length == 0 ? "" : "\r\nContent-Type: application/x-apple-binary-plist")
+            + "\r\nContent-Length: " + info.length + "\r\n\r\n";
         OutputStream out = tcp.getOutputStream();
         lastWriteNs = System.nanoTime();
         watchdog.scheduleAtFixedRate(() -> {
             if (!closed.get() && System.nanoTime() - lastWriteNs > TimeUnit.SECONDS.toNanos(5)) fail("镜像连接写入超时");
         }, 1, 1, TimeUnit.SECONDS);
-        // Some receivers attach the mirror session to the capability request's TCP connection.
+        // Use the same identity from the first HTTP request so receivers can associate it with RTSP.
         String preflight = "GET /stream.xml HTTP/1.1\r\nHost: " + host + ":" + endpoint.mirrorPort().getAsInt()
-                + "\r\nUser-Agent: HuaweiCast-Experimental/1.0\r\nContent-Length: 0\r\nConnection: keep-alive\r\n\r\n";
+                + "\r\nUser-Agent: " + userAgent + "\r\nX-Apple-Device-ID: 0x" + Long.toHexString(id)
+                + "\r\nX-Apple-ProtocolVersion: 0\r\nX-Apple-Client-Name: HuaweiCast"
+                + "\r\nContent-Length: 0\r\nConnection: keep-alive\r\n\r\n";
         out.write(preflight.getBytes(StandardCharsets.US_ASCII)); out.flush();
         LelinkProbe.Response response = LelinkProbe.readResponse(tcp.getInputStream(), true, false);
-        if (response.status() == 401 || response.status() == 403) throw new IOException("接收端要求授权，实验已停止");
+        if (response.status() == 401 || response.status() == 403) throw new IOException("接收端要求授权，兼容镜像已停止");
         if (response.status() != 200) throw new IOException("接收端拒绝镜像能力请求 (" + response.status() + ")");
         LelinkProbe.parseCapabilities(response.body());
-        if (closed.get()) throw new IOException("实验已取消");
+        if (closed.get()) throw new IOException("兼容镜像已取消");
         lastWriteNs = System.nanoTime();
-        out.write(header.getBytes(StandardCharsets.US_ASCII)); out.write(info); out.flush();
+        ByteArrayOutputStream request = new ByteArrayOutputStream();
+        request.write(header.getBytes(StandardCharsets.US_ASCII)); request.write(info);
+        out.write(request.toByteArray()); out.flush();
+        // This legacy receiver discards bytes coalesced with POST, including an immediately following frame.
+        if (companionAudio) TimeUnit.MILLISECONDS.sleep(100);
+        if (closed.get()) throw new IOException("兼容镜像已取消");
         start("legacy-mirror-timing", () -> timingLoop(udp, endpoint.address()));
         start("legacy-mirror-response", () -> responseLoop(tcp));
         start("legacy-mirror-writer", () -> {
-            boolean configured = false;
             while (!closed.get()) {
                 Frame frame = frames.poll(1, TimeUnit.SECONDS);
                 if (frame == null) out.write(LegacyMirrorWire.heartbeatPacket());
                 else {
-                    byte[] s = sps, p = pps;
-                    if (s == null || p == null || (!configured && !frame.key())) continue;
+                    CodecConfig config = frame.config();
+                    if (config.generation() != formatGeneration) continue;
+                    if (System.nanoTime() - frame.queuedNs() > MAX_QUEUE_AGE_NS) { recoverQueue(config.generation()); continue; }
                     long pts = Math.max(0, frame.pts() - epochNs / 1000);
-                    if (frame.key()) { out.write(LegacyMirrorWire.codecPacket(s, p, width, height, pts)); configured = true; }
-                    out.write(LegacyMirrorWire.videoPacket(frame.data(), width, height, pts));
-                    sentFrames++;
+                    if (frame.key()) out.write(LegacyMirrorWire.codecPacket(config.sps(), config.pps(), config.width(), config.height(), pts));
+                    out.write(LegacyMirrorWire.videoPacket(frame.data(), config.width(), config.height(), pts));
                 }
                 out.flush(); lastWriteNs = System.nanoTime();
+                if (frame != null) sentFrames++;
             }
         });
     }
@@ -126,35 +197,82 @@ public final class LegacyMirrorClient implements AutoCloseable {
         }
     }
     private void responseLoop(Socket tcp) throws IOException {
-        // Legacy mirroring need not reply with HTTP. Any explicit rejection terminates the attempt.
-        ByteArrayOutputStream header = new ByteArrayOutputStream();
+        // Silence is allowed, but keep reading after a successful response to detect later disconnects or rejection.
         InputStream in = tcp.getInputStream();
         while (!closed.get()) {
-            int value;
-            try { value = in.read(); } catch (SocketTimeoutException ignored) { continue; }
-            if (value < 0) throw new EOFException("接收端关闭了实验连接");
-            header.write(value);
-            if (header.size() > 8192) throw new IOException("接收端返回无法识别的数据");
-            if (value == '\n') {
-                String line = header.toString(StandardCharsets.US_ASCII.name()).trim();
-                if (line.matches("HTTP/1\\.[01] (401|403)( .*)?")) throw new IOException("接收端要求授权，实验已停止");
-                if (!line.matches("HTTP/1\\.[01] 2[0-9][0-9]( .*)?")) throw new IOException("接收端拒绝或不支持此镜像握手");
-                return;
+            int first = readResponseByte(in, 0);
+            long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(5);
+            int[] remaining = {LelinkProbe.MAX_HEADERS};
+            String status = readResponseLine(in, first, deadline, remaining);
+            if (status.matches("HTTP/1\\.[01] (401|403)( .*)?")) throw new IOException("接收端要求授权，兼容镜像已停止");
+            if (!status.matches("HTTP/1\\.[01] 2[0-9][0-9]( .*)?")) throw new IOException("接收端拒绝或不支持此镜像握手");
+            Map<String, String> headers = new HashMap<>();
+            while (true) {
+                String line = readResponseLine(in, readResponseByte(in, deadline), deadline, remaining);
+                if (line.isEmpty()) break;
+                int colon = line.indexOf(':');
+                if (colon < 1 || Character.isWhitespace(line.charAt(0))) throw new IOException("接收端返回无效响应头");
+                String name = line.substring(0, colon).toLowerCase(Locale.ROOT);
+                if (headers.put(name, line.substring(colon + 1).trim()) != null
+                        && (name.equals("content-length") || name.equals("transfer-encoding"))) throw new IOException("接收端返回重复长度字段");
             }
+            if (headers.containsKey("transfer-encoding")) throw new IOException("接收端返回不支持的镜像响应编码");
+            String length = headers.getOrDefault("content-length", "0");
+            if (!length.matches("[0-9]{1,8}")) throw new IOException("接收端返回无效响应长度");
+            int count = Integer.parseInt(length);
+            if (count > LelinkProbe.MAX_BODY) throw new IOException("接收端响应过大");
+            for (int i = 0; i < count; i++) readResponseByte(in, deadline);
+        }
+    }
+    private int readResponseByte(InputStream input, long deadline) throws IOException {
+        while (!closed.get()) {
+            if (deadline != 0 && System.nanoTime() - deadline >= 0) throw new SocketTimeoutException("接收端镜像响应超时");
+            try {
+                int value = input.read();
+                if (value < 0) throw new EOFException("接收端关闭了镜像连接");
+                return value;
+            } catch (SocketTimeoutException timeout) {
+                if (deadline != 0 && System.nanoTime() - deadline >= 0) throw new SocketTimeoutException("接收端镜像响应超时");
+            }
+        }
+        throw new SocketException("镜像连接已关闭");
+    }
+    private String readResponseLine(InputStream input, int first, long deadline, int[] remaining) throws IOException {
+        ByteArrayOutputStream line = new ByteArrayOutputStream();
+        int value = first;
+        while (true) {
+            if (--remaining[0] < 0) throw new IOException("接收端响应头过大");
+            if (value == '\r') {
+                if (--remaining[0] < 0 || readResponseByte(input, deadline) != '\n') throw new IOException("接收端返回无效响应行");
+                return line.toString(StandardCharsets.US_ASCII.name());
+            }
+            if (value < 32 || value > 126) throw new IOException("接收端返回无效响应字符");
+            line.write(value);
+            value = readResponseByte(input, deadline);
         }
     }
     private interface Action { void run() throws Exception; }
     private void start(String name, Action action) {
-        Thread thread = new Thread(() -> { try { action.run(); } catch (Exception error) { if (!closed.get()) fail(error.getMessage()); } }, name);
-        thread.setDaemon(true); thread.start();
+        Thread thread = new Thread(() -> {
+            try { action.run(); }
+            catch (Exception error) {
+                if (!closed.get()) fail(error instanceof SocketException ? "接收端已断开或网络连接中断" : error.getMessage());
+            }
+            finally { ioThreads.remove(Thread.currentThread()); }
+        }, name);
+        thread.setDaemon(true); ioThreads.add(thread);
+        if (closed.get()) { ioThreads.remove(thread); return; }
+        thread.start();
     }
-    private void fail(String message) { if (closeOnce()) failure.accept(message == null ? "实验镜像连接失败" : message); }
+    private void fail(String message) { if (closeOnce()) failure.accept(message == null ? "兼容镜像连接失败" : message); }
     @Override public void close() { closeOnce(); }
     private boolean closeOnce() {
         if (!closed.compareAndSet(false, true)) return false;
-        frames.clear(); watchdog.shutdownNow();
+        synchronized (frameLock) { frames.clear(); configuration = null; }
+        watchdog.shutdownNow();
         Socket tcp = socket; if (tcp != null) try { tcp.close(); } catch (IOException ignored) {}
         DatagramSocket udp = timing; if (udp != null) udp.close();
+        for (Thread thread : ioThreads) if (thread != Thread.currentThread()) thread.interrupt();
         return true;
     }
 }

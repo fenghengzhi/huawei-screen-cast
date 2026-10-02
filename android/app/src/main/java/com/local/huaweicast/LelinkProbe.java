@@ -28,7 +28,11 @@ import org.xml.sax.InputSource;
 import org.xml.sax.SAXException;
 import org.xml.sax.helpers.DefaultHandler;
 
-/** Read-only discovery follow-up; never creates a mirror session or supplies credentials. */
+/**
+ * Bounded active diagnostics and shared response parsing; sends no media or credentials.
+ * GET /stream.xml can start receiver mirror state, and closing its socket can stop it.
+ * This is not side-effect-free discovery and must not precede screen-sharing consent.
+ */
 public final class LelinkProbe implements AutoCloseable {
     static final int MAX_HEADERS = 8192;
     static final int MAX_BODY = 32768;

@@ -10,18 +10,23 @@ if (metadata.elements.length !== 1) throw new Error('Expected one universal rele
 const apk = metadata.elements[0];
 if (`v${apk.versionName}` !== tag) throw new Error('Tag must match versionName in android/app/build.gradle');
 if (path.basename(apk.outputFile) !== apk.outputFile || apk.outputFile.includes('unsigned')) throw new Error('Expected a signed release APK');
-await mkdir('dist', { recursive: true });
 const filename = `huawei-screen-cast-${apk.versionName}.apk`;
-await copyFile(path.join(directory, apk.outputFile), path.join('dist', filename));
+const fdkSourceFilename = 'fdk-aac-2.0.3-source.zip';
+const fdkSource = await readFile(path.join('android/app/build/generated/fdkSource', fdkSourceFilename));
 const notices = [];
-for (const file of ['LICENSE', 'third_party/NOTICE.md', 'third_party/AirSonic-LICENSE', 'third_party/NanoHTTPD-LICENSE']) {
+for (const file of ['LICENSE', 'third_party/NOTICE.md', 'third_party/AirSonic-LICENSE',
+  'third_party/NanoHTTPD-LICENSE', 'third_party/dd-plist-LICENSE',
+  'third_party/fdk-aac/NOTICE', 'third_party/fdk-aac-PROVENANCE.md']) {
   notices.push(`${file}\n\n${await readFile(file, 'utf8')}`);
 }
+await mkdir('dist', { recursive: true });
+await copyFile(path.join(directory, apk.outputFile), path.join('dist', filename));
+await writeFile(path.join('dist', fdkSourceFilename), fdkSource);
 await writeFile('dist/THIRD-PARTY-NOTICES.txt', notices.join('\n\n-----\n\n'));
 const checksums = [];
-for (const file of [filename, 'THIRD-PARTY-NOTICES.txt']) {
+for (const file of [filename, fdkSourceFilename, 'THIRD-PARTY-NOTICES.txt']) {
   const hash = createHash('sha256').update(await readFile(path.join('dist', file))).digest('hex');
   checksums.push(`${hash}  ${file}`);
 }
 await writeFile('dist/SHA256SUMS.txt', checksums.join('\n') + '\n');
-console.log(`Prepared ${filename}, notices and checksums for ${tag}`);
+console.log(`Prepared ${filename}, FDK source, notices and checksums for ${tag}`);

@@ -25,8 +25,8 @@ import kotlin.concurrent.thread
  * （把损坏的 P 帧喂给播放器会让其解码器冻屏）。
  */
 class ScreenMirrorCaster(
-    private val width: Int = 1280,
-    private val height: Int = 720,
+    private var width: Int = 1280,
+    private var height: Int = 720,
     private val dpi: Int = 320,
     private val bitRate: Int = 10_000_000,
     private val frameRate: Int = 30,
@@ -58,6 +58,7 @@ class ScreenMirrorCaster(
     private val onRawAudioFrame: ((adtsFrame: ByteArray, ptsUs: Long) -> Unit)? = null,
     private val onCapturedVideoFrame: ((data: ByteArray, monotonicUs: Long, keyframe: Boolean) -> Unit)? = null,
 ) {
+    private val lifecycleLock = Any()
     @Volatile private var codec: MediaCodec? = null
     private var display: android.hardware.display.VirtualDisplay? = null
     private var inputSurface: android.view.Surface? = null
@@ -79,19 +80,66 @@ class ScreenMirrorCaster(
         }
     }
     private val muxer = TsMuxer(audioPid = if (withAudio) 0x102 else null, videoCodec = videoCodec, onPacket = packetSink)
-    private val parameterSets = VideoParameterSets(videoCodec)
+    private var parameterSets = VideoParameterSets(videoCodec)
     @Volatile private var running = false
     private var drainThread: Thread? = null
+    private var syncThread: Thread? = null
     /** 编码器是否已产出所选格式的完整参数集。 */
     @Volatile var ready = false; private set
     /** start 失败原因（vivo 等 ROM 屏蔽 logcat，诊断须透传到 UI 状态行）。 */
     @Volatile var lastError: String? = null; private set
 
     /** 开始采集编码。[projection] 须已授权且前台 Service 已起。返回 false=编码器初始化失败（原因见 [lastError]）。 */
-    fun start(projection: MediaProjection): Boolean {
+    fun start(projection: MediaProjection): Boolean = synchronized(lifecycleLock) {
+        if (this.projection != null) {
+            lastError = "录屏会话已经启动"
+            return@synchronized false
+        }
         this.projection = projection
         // Android 14+ 强制：createVirtualDisplay 前必须 registerCallback，否则 SecurityException
-        runCatching { projection.registerCallback(projectionCallback, null) }
+        try {
+            projection.registerCallback(projectionCallback, android.os.Handler(android.os.Looper.getMainLooper()))
+        } catch (error: Exception) {
+            lastError = "注册录屏回调: ${error.javaClass.simpleName} ${error.message}"
+            return@synchronized false
+        }
+        startEncoder(projection)
+    }
+
+    /** Reuses the projection's single virtual display; call off the main thread. */
+    fun resize(width: Int, height: Int, beforeRestart: () -> Unit = {}): Boolean = synchronized(lifecycleLock) {
+        if (width <= 0 || height <= 0 || width % 2 != 0 || height % 2 != 0) {
+            lastError = "录屏尺寸必须是正偶数"
+            return@synchronized false
+        }
+        val projection = this.projection
+        if (!running || projection == null || display == null) {
+            lastError = "录屏会话未运行，无法调整尺寸"
+            return@synchronized false
+        }
+        if (this.width == width && this.height == height) return@synchronized true
+        if (!stopEncoder()) return@synchronized false
+        this.width = width
+        this.height = height
+        ready = false
+        parameterSets = VideoParameterSets(videoCodec)
+        gating = false
+        inKeyframe = false
+        droppedInFrame = false
+        lastSyncRequestAt = 0
+        // Preserve TS continuity and the audio/video clock across an encoder replacement.
+        muxer.forcePatPmt()
+        try {
+            beforeRestart()
+        } catch (error: Exception) {
+            lastError = "调整投屏尺寸: ${error.javaClass.simpleName} ${error.message}"
+            return@synchronized false
+        }
+        startEncoder(projection)
+    }
+
+    private fun startEncoder(projection: MediaProjection): Boolean {
+        lastError = null
         val encoderInfo = MediaCodecList(MediaCodecList.REGULAR_CODECS).codecInfos.firstOrNull {
             it.isEncoder && it.isHardwareAccelerated && it.supportedTypes.any { type -> type.equals(videoCodec.mime(), ignoreCase = true) }
         }
@@ -136,14 +184,16 @@ class ScreenMirrorCaster(
             onLog("编码器初始化失败: ${t.message}")
             return false
         }
+        var candidateSurface: android.view.Surface? = null
         val surface = try {
-            val s = c.createInputSurface()
+            val s = c.createInputSurface().also { candidateSurface = it }
             c.start()
             s
         } catch (t: Throwable) {
             lastError = "编码器start: ${t.javaClass.simpleName} ${t.message}"
             onLog("编码器 start 失败: ${t.message}")
             runCatching { c.release() }
+            runCatching { candidateSurface?.release() }
             return false
         }
         codec = c
@@ -151,14 +201,21 @@ class ScreenMirrorCaster(
         try {
             val repeater = com.local.huaweicast.FrameRepeater(surface, width, height, frameRate)
             frameRepeater = repeater
-            display = projection.createVirtualDisplay(
-                "airsonic-mirror", width, height, dpi,
-                DisplayManager.VIRTUAL_DISPLAY_FLAG_AUTO_MIRROR, repeater.surface, null, null
-            )
+            val currentDisplay = display
+            if (currentDisplay == null) {
+                display = projection.createVirtualDisplay(
+                    "airsonic-mirror", width, height, dpi,
+                    DisplayManager.VIRTUAL_DISPLAY_FLAG_AUTO_MIRROR, repeater.surface, null, null
+                )
+            } else {
+                currentDisplay.resize(width, height, dpi)
+                currentDisplay.surface = repeater.surface
+            }
         } catch (t: Throwable) {
             lastError = "虚拟屏: ${t.javaClass.simpleName} ${t.message}"
             onLog("createVirtualDisplay 失败: ${t.message}")
-            frameRepeater?.release(); frameRepeater = null
+            runCatching { display?.surface = null }
+            runCatching { frameRepeater?.release() }; frameRepeater = null
             runCatching { c.stop() }; runCatching { c.release() }; codec = null
             surface.release(); inputSurface = null
             return false
@@ -167,12 +224,12 @@ class ScreenMirrorCaster(
         drainThread = thread(isDaemon = true, name = "airsonic-screen-drain") { drainLoop(c) }
         if (syncFrameIntervalMs > 0) {
             // HLS 降延迟：周期强制关键帧 → 分片边界密度 = 该周期（独立于拥塞恢复的节流通道）
-            thread(isDaemon = true, name = "airsonic-sync-tick") {
-                while (running) {
+            syncThread = thread(isDaemon = true, name = "airsonic-sync-tick") {
+                while (running && codec === c) {
                     try { Thread.sleep(syncFrameIntervalMs) } catch (_: InterruptedException) { break }
-                    if (!running) break
+                    if (!running || codec !== c) break
                     runCatching {
-                        codec?.setParameters(android.os.Bundle().apply {
+                        c.setParameters(android.os.Bundle().apply {
                             putInt(MediaCodec.PARAMETER_KEY_REQUEST_SYNC_FRAME, 0)
                         })
                     }
@@ -185,35 +242,37 @@ class ScreenMirrorCaster(
 
     private fun drainLoop(c: MediaCodec) {
         val info = MediaCodec.BufferInfo()
-        while (running) {
-            val idx = try { c.dequeueOutputBuffer(info, 10_000) } catch (t: Throwable) {
-                if (running) onLog("dequeue 异常: ${t.message}")
+        while (running && codec === c) {
+            try {
+                val idx = c.dequeueOutputBuffer(info, 10_000)
+                when {
+                    idx == MediaCodec.INFO_OUTPUT_FORMAT_CHANGED -> {
+                        val output = c.outputFormat
+                        onLog("编码器格式: $output")
+                        for (key in arrayOf("csd-0", "csd-1", "csd-2")) {
+                            output.getByteBuffer(key)?.duplicate()?.let { buffer ->
+                                val data = ByteArray(buffer.remaining()); buffer.get(data); acceptParameterSets(data)
+                            }
+                        }
+                    }
+                    idx >= 0 -> {
+                        val buf = c.getOutputBuffer(idx)
+                        if (buf != null && info.size > 0) {
+                            val data = ByteArray(info.size)
+                            buf.position(info.offset); buf.limit(info.offset + info.size)
+                            buf.get(data)
+                            // handleFrame 内含 muxer/SPS 解析等可能抛异常的链路（尤其畸形输入），
+                            // 绝不能让它杀死 drain 线程——编码器无人消费 = 镜像无声冻屏
+                            try { handleFrame(data, info) } catch (t: Throwable) {
+                                onLog("handleFrame 异常已吞: ${t.javaClass.simpleName} ${t.message}")
+                            }
+                        }
+                        c.releaseOutputBuffer(idx, false)
+                    }
+                }
+            } catch (error: Exception) {
+                if (running && codec === c) onLog("编码输出异常: ${error.javaClass.simpleName} ${error.message}")
                 break
-            }
-            when {
-                idx == MediaCodec.INFO_OUTPUT_FORMAT_CHANGED -> {
-                    val output = c.outputFormat
-                    onLog("编码器格式: $output")
-                    for (key in arrayOf("csd-0", "csd-1", "csd-2")) {
-                        output.getByteBuffer(key)?.duplicate()?.let { buffer ->
-                            val data = ByteArray(buffer.remaining()); buffer.get(data); acceptParameterSets(data)
-                        }
-                    }
-                }
-                idx >= 0 -> {
-                    val buf = c.getOutputBuffer(idx)
-                    if (buf != null && info.size > 0) {
-                        val data = ByteArray(info.size)
-                        buf.position(info.offset); buf.limit(info.offset + info.size)
-                        buf.get(data)
-                        // handleFrame 内含 muxer/SPS 解析等可能抛异常的链路（尤其畸形输入），
-                        // 绝不能让它杀死 drain 线程——编码器无人消费 = 镜像无声冻屏
-                        try { handleFrame(data, info) } catch (t: Throwable) {
-                            onLog("handleFrame 异常已吞: ${t.javaClass.simpleName} ${t.message}")
-                        }
-                    }
-                    c.releaseOutputBuffer(idx, false)
-                }
             }
         }
     }
@@ -285,18 +344,41 @@ class ScreenMirrorCaster(
         requestSyncFrame()
     }
 
-    fun stop() {
+    fun stop() = synchronized(lifecycleLock) {
+        stopEncoder()
         runCatching { display?.release() }; display = null
-        frameRepeater?.release(); frameRepeater = null
-        running = false
-        drainThread?.join(1500)
-        runCatching { display?.release() }; display = null
-        runCatching { codec?.stop() }
-        runCatching { codec?.release() }; codec = null
-        runCatching { inputSurface?.release() }; inputSurface = null
         projection?.let { runCatching { it.unregisterCallback(projectionCallback) } }
         projection = null
+        ready = false
         onLog("录屏编码已停止")
+    }
+
+    private fun stopEncoder(): Boolean {
+        runCatching { display?.surface = null }
+        // Keep draining while the renderer finishes its last EGL swap.
+        runCatching { frameRepeater?.release() }; frameRepeater = null
+        running = false
+        syncThread?.interrupt()
+        val drain = drainThread
+        val sync = syncThread
+        try {
+            sync?.join(1500)
+            drain?.join(1500)
+        } catch (_: InterruptedException) {
+            Thread.currentThread().interrupt()
+        }
+        val stoppedCodec = codec
+        codec = null
+        runCatching { stoppedCodec?.stop() }
+        runCatching { stoppedCodec?.release() }
+        runCatching { inputSurface?.release() }; inputSurface = null
+        if (drain?.isAlive == true || sync?.isAlive == true) {
+            lastError = "旧编码线程未及时退出，投屏已停止"
+            return false
+        }
+        drainThread = null
+        syncThread = null
+        return true
     }
 
     private fun acceptParameterSets(data: ByteArray) {

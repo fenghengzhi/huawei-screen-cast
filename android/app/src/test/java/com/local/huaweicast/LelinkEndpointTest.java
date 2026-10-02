@@ -27,6 +27,8 @@ public class LelinkEndpointTest {
         assertEquals(7000, endpoint(txt("remote", "6000", "LELINKPORT", "7000")).controlPort());
         assertFalse(endpoint(Map.of()).mirrorPort().isPresent());
         assertEquals(7200, endpoint(txt("mirror", "7200")).mirrorPort().getAsInt());
+        assertFalse(endpoint(Map.of()).raopPort().isPresent());
+        assertEquals(52244, endpoint(txt("raop", "52244")).raopPort().getAsInt());
         assertTrue(endpoint(Map.of()).summary().contains("未广播镜像端口"));
     }
 
@@ -35,18 +37,23 @@ public class LelinkEndpointTest {
         for (String port : new String[]{"", "0", "65536", "-1", "+12", " 12", "12 ", "12x", "１２", "999999999"}) {
             rejected(() -> LelinkEndpoint.from("receiver", host, 7100, txt("lelinkport", port, "remote", "6000")));
             rejected(() -> LelinkEndpoint.from("receiver", host, 7100, txt("mirror", port)));
+            rejected(() -> LelinkEndpoint.from("receiver", host, 7100, txt("raop", port)));
         }
         rejected(() -> LelinkEndpoint.from("receiver", host, 0, Map.of()));
         rejected(() -> LelinkEndpoint.from("receiver", host, 65536, txt("remote", "6000")));
         rejected(() -> LelinkEndpoint.from("receiver", host, 7100, txt("lelinkport", "6000", "remote", "invalid")));
         assertEquals(1, endpoint(txt("remote", "1")).controlPort());
         assertEquals(65535, endpoint(txt("remote", "65535")).controlPort());
+        assertEquals(1, endpoint(txt("raop", "1")).raopPort().getAsInt());
+        assertEquals(65535, endpoint(txt("raop", "65535")).raopPort().getAsInt());
     }
 
     @Test public void recognizedKeysAreCaseInsensitiveButDuplicatesAreRejected() throws Exception {
         InetAddress host = InetAddress.getByAddress(new byte[]{10, 0, 0, 1});
         rejected(() -> LelinkEndpoint.from("receiver", host, 7100, txt("remote", "6000", "REMOTE", "6001")));
         rejected(() -> LelinkEndpoint.from("receiver", host, 7100, txt("version", "1", "VERSION", "2")));
+        rejected(() -> LelinkEndpoint.from("receiver", host, 7100, txt("raop", "6000", "RAOP", "6001")));
+        assertEquals(6000, endpoint(txt("RAOP", "6000")).raopPort().getAsInt());
         assertEquals("1.0", endpoint(txt("VERSION", "1.0")).metadata().get("version"));
     }
 

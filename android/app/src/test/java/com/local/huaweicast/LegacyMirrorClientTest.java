@@ -25,7 +25,10 @@ public class LegacyMirrorClientTest {
         public void bind(DatagramSocket socket) {}
     };
     private static void await(BooleanSupplier condition) throws Exception {
-        long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(2);
+        await(condition, 2);
+    }
+    private static void await(BooleanSupplier condition, int seconds) throws Exception {
+        long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(seconds);
         while (!condition.getAsBoolean() && System.nanoTime() < deadline) Thread.sleep(5);
         assertTrue("Condition did not complete", condition.getAsBoolean());
     }
@@ -61,6 +64,61 @@ public class LegacyMirrorClientTest {
         }
     }
 
+    @Test public void videoUsesSharedAudioSessionClockAndNegotiatedLatency() throws Exception {
+        LegacyMirrorSession session = new LegacyMirrorSession(0x020000000042L, 77, System.nanoTime() - TimeUnit.SECONDS.toNanos(5));
+        try (Fixture f = new Fixture(); LegacyMirrorClient client = new LegacyMirrorClient(960, 540, () -> {}, message -> fail(message),
+                session, 150, new LegacyMirrorClient.SocketFactory() {
+                    public Socket createSocket() { return f.tcp; }
+                    public DatagramSocket createDatagramSocket() { return f.udp; }
+                })) {
+            client.connect(f.endpoint, BINDER);
+            client.configure(SPS, PPS);
+            client.offer(FRAME, session.epochNs() / 1000 + 2_000_000, true);
+            await(() -> client.sentFrames() == 1);
+            byte[] bytes = f.tcp.bytes();
+            String request = new String(bytes, StandardCharsets.ISO_8859_1);
+            int post = request.indexOf("POST /stream HTTP/1.1");
+            String identity = "X-Apple-Device-ID: 0x" + Long.toHexString(session.deviceId()) + "\r\n";
+            assertTrue(request.substring(0, post).contains(identity));
+            assertTrue(request.substring(post).contains(identity));
+            assertTrue(request.substring(0, post).contains("X-Apple-ProtocolVersion: 0\r\n"));
+            assertTrue(request.substring(0, post).contains("User-Agent: HuaweiCast-Experimental/1.0\r\n"));
+            int body = request.indexOf("\r\n\r\n", post) + 4;
+            int header = request.indexOf("Content-Length: ", post);
+            int length = Integer.parseInt(request.substring(header + 16, request.indexOf("\r\n", header)));
+            NSDictionary plist = (NSDictionary) PropertyListParser.parse(Arrays.copyOfRange(bytes, body, body + length));
+            assertEquals("77", plist.objectForKey("sessionID").toString());
+            assertEquals(Long.toString(session.deviceId()), plist.objectForKey("deviceID").toString());
+            assertEquals("150", plist.objectForKey("latencyMs").toString());
+            assertEquals(LegacyMirrorWire.ntpTimestamp(2_000_000), ByteBuffer.wrap(bytes).order(ByteOrder.LITTLE_ENDIAN).getLong(body + length + 8));
+        }
+    }
+
+    @Test public void companionAudioProfileUsesBodylessPostBeforeVideoPackets() throws Exception {
+        LegacyMirrorSession session = LegacyMirrorSession.create();
+        try (Fixture f = new Fixture(); LegacyMirrorClient client = new LegacyMirrorClient(960, 540, () -> {},
+                message -> fail(message), session, 100, true, new LegacyMirrorClient.SocketFactory() {
+                    public Socket createSocket() { return f.tcp; }
+                    public DatagramSocket createDatagramSocket() { return f.udp; }
+                })) {
+            client.connect(f.endpoint, BINDER);
+            client.configure(SPS, PPS);
+            client.offer(FRAME, session.epochNs() / 1000 + 2_000_000, true);
+            await(() -> client.sentFrames() == 1);
+            byte[] bytes = f.tcp.bytes();
+            String request = new String(bytes, StandardCharsets.ISO_8859_1);
+            int post = request.indexOf("POST /stream HTTP/1.1");
+            int end = request.indexOf("\r\n\r\n", post) + 4;
+            assertTrue(request.substring(0, post).contains("User-Agent: AirParrot/1.1 HuaweiCast/1.0\r\n"));
+            assertTrue(request.substring(post, end).contains("User-Agent: AirParrot/1.1 HuaweiCast/1.0\r\n"));
+            assertTrue(request.substring(post, end).contains("Content-Length: 0\r\n"));
+            assertFalse(request.substring(post, end).contains("Content-Type:"));
+            assertFalse(request.contains("bplist00"));
+            assertEquals(1, ByteBuffer.wrap(bytes).order(ByteOrder.LITTLE_ENDIAN).getShort(end + 4));
+            assertEquals(LegacyMirrorWire.ntpTimestamp(2_000_000), ByteBuffer.wrap(bytes).order(ByteOrder.LITTLE_ENDIAN).getLong(end + 8));
+        }
+    }
+
     @Test public void preflightAuthorizationRejectionDoesNotSendPost() throws Exception {
         for (int status : new int[]{401, 403}) {
             try (Fixture f = new Fixture()) {
@@ -74,6 +132,7 @@ public class LegacyMirrorClientTest {
             }
         }
     }
+
 
     @Test public void invalidCapabilitiesDoNotStartStreaming() throws Exception {
         try (Fixture f = new Fixture()) {
@@ -145,6 +204,7 @@ public class LegacyMirrorClientTest {
 
     @Test public void overflowDropsDependentFramesUntilNewKeyframe() throws Exception {
         try (Fixture f = new Fixture()) {
+            f.client.configure(SPS, PPS);
             for (int i = 0; i < 9; i++) f.client.offer(FRAME, System.nanoTime() / 1000, true);
             assertEquals(1, f.keys.get());
             f.client.offer(FRAME, System.nanoTime() / 1000, false);
@@ -155,6 +215,149 @@ public class LegacyMirrorClientTest {
             f.client.offer(FRAME, System.nanoTime() / 1000, true);
             await(() -> f.client.sentFrames() == 1);
         }
+    }
+
+    @Test public void successfulResponseDoesNotStopDisconnectMonitoringOrReconnect() throws Exception {
+        try (Fixture f = new Fixture()) {
+            f.client.connect(f.endpoint, BINDER);
+            f.tcp.reply("HTTP/1.1 200 OK\r\nContent-Length: 3\r\n\r\nOK!");
+            f.tcp.input.add(-1);
+            await(() -> f.failures.get() == 1);
+            assertTrue(f.message.contains("关闭了镜像连接"));
+            assertTrue(f.udp.closed);
+            assertEquals(1, f.tcp.connections);
+            try { f.client.connect(f.endpoint, BINDER); fail(); }
+            catch (IOException expected) {}
+            assertEquals(1, f.tcp.connections);
+        }
+    }
+
+    @Test public void laterAuthorizationRejectionStopsEstablishedSession() throws Exception {
+        try (Fixture f = new Fixture()) {
+            f.client.connect(f.endpoint, BINDER);
+            f.tcp.reply("HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\nHTTP/1.1 403 Forbidden\r\n\r\n");
+            await(() -> f.failures.get() == 1);
+            assertTrue(f.message.contains("要求授权"));
+            assertEquals(1, f.tcp.connections);
+        }
+    }
+
+    @Test public void incompleteResponseHasDeadlineEvenWhileHeartbeatsSucceed() throws Exception {
+        try (Fixture f = new Fixture()) {
+            f.client.connect(f.endpoint, BINDER);
+            f.tcp.reply("HTTP/1.1 200");
+            await(() -> f.failures.get() == 1, 8);
+            assertTrue(f.message.contains("响应超时"));
+            assertTrue(f.tcp.closed);
+        }
+    }
+
+    @Test public void idleConnectionSendsHeartbeatWithoutClaimingVideoFrames() throws Exception {
+        try (Fixture f = new Fixture()) {
+            f.client.connect(f.endpoint, BINDER);
+            int before = f.tcp.bytes().length;
+            await(() -> f.tcp.bytes().length >= before + LegacyMirrorWire.HEADER_SIZE);
+            assertArrayEquals(LegacyMirrorWire.heartbeatPacket(), Arrays.copyOfRange(f.tcp.bytes(), before, before + LegacyMirrorWire.HEADER_SIZE));
+            assertEquals(0, f.client.sentFrames());
+            assertEquals(0, f.failures.get());
+        }
+    }
+
+    @Test public void staleQueuedFramesAreDiscardedUntilFreshKeyframe() throws Exception {
+        try (Fixture f = new Fixture()) {
+            f.client.configure(SPS, PPS);
+            f.client.offer(FRAME, System.nanoTime() / 1000, true);
+            Thread.sleep(550);
+            f.client.connect(f.endpoint, BINDER);
+            await(() -> f.keys.get() == 1);
+            assertEquals(0, f.client.sentFrames());
+            f.client.offer(FRAME, System.nanoTime() / 1000, false);
+            assertEquals(0, f.client.sentFrames());
+            f.client.offer(FRAME, System.nanoTime() / 1000, true);
+            await(() -> f.client.sentFrames() == 1);
+        }
+    }
+
+    @Test public void resizeDiscardsOldQueuedConfigurationAndRequiresNewKeyframe() throws Exception {
+        try (Fixture f = new Fixture()) {
+            f.client.configure(SPS, PPS);
+            f.client.offer(FRAME, System.nanoTime() / 1000, true);
+            f.client.resize(540, 960);
+            f.client.offer(FRAME, System.nanoTime() / 1000, true);
+            f.client.configure(SPS, PPS);
+            f.client.offer(FRAME, System.nanoTime() / 1000, false);
+            f.client.connect(f.endpoint, BINDER);
+            Thread.sleep(100);
+            assertEquals(0, f.client.sentFrames());
+            f.client.offer(FRAME, System.nanoTime() / 1000, true);
+            await(() -> f.client.sentFrames() == 1);
+            byte[] bytes = f.tcp.bytes();
+            ByteBuffer wire = ByteBuffer.wrap(bytes).order(ByteOrder.LITTLE_ENDIAN);
+            int packet = firstPacket(bytes);
+            assertEquals(1, wire.getShort(packet + 4));
+            assertEquals(540f, wire.getFloat(packet + 16), 0f);
+            assertEquals(960f, wire.getFloat(packet + 20), 0f);
+            assertEquals(0f, wire.getFloat(packet + 56), 0f);
+            assertEquals(0f, wire.getFloat(packet + 60), 0f);
+        }
+    }
+
+    @Test public void liveResizeKeepsSameConnectionAndClock() throws Exception {
+        try (Fixture f = new Fixture()) {
+            f.client.connect(f.endpoint, BINDER);
+            f.client.configure(SPS, PPS);
+            f.client.offer(FRAME, System.nanoTime() / 1000, true);
+            await(() -> f.client.sentFrames() == 1);
+            byte[] initial = f.tcp.bytes();
+            long firstPts = ByteBuffer.wrap(initial).order(ByteOrder.LITTLE_ENDIAN).getLong(firstPacket(initial) + 8);
+            f.client.resize(540, 960);
+            f.client.configure(SPS, PPS);
+            Thread.sleep(10);
+            f.client.offer(FRAME, System.nanoTime() / 1000, true);
+            await(() -> f.client.sentFrames() == 2);
+            ByteBuffer wire = ByteBuffer.wrap(f.tcp.bytes()).order(ByteOrder.LITTLE_ENDIAN);
+            assertEquals(1, wire.getShort(initial.length + 4));
+            assertEquals(540f, wire.getFloat(initial.length + 16), 0f);
+            assertTrue(wire.getLong(initial.length + 8) > firstPts);
+            assertEquals(1, f.tcp.connections);
+        }
+    }
+
+    @Test public void cancellationUnblocksConnectWithoutFalseFailure() throws Exception {
+        try (Fixture f = new Fixture()) {
+            f.tcp.blockConnect = true;
+            ExecutorService worker = Executors.newSingleThreadExecutor();
+            try {
+                Future<?> connect = worker.submit(() -> { try { f.client.connect(f.endpoint, BINDER); } catch (Exception expected) {} });
+                assertTrue(f.tcp.connectEntered.await(1, TimeUnit.SECONDS));
+                f.client.close();
+                connect.get(1, TimeUnit.SECONDS);
+                assertTrue(f.udp.closed);
+                assertEquals(0, f.failures.get());
+            } finally { worker.shutdownNow(); }
+        }
+    }
+
+    @Test public void cancellationUnblocksActiveWriterWithoutFalseFailure() throws Exception {
+        try (Fixture f = new Fixture()) {
+            f.client.connect(f.endpoint, BINDER);
+            f.client.configure(SPS, PPS);
+            f.tcp.blockWrites = true;
+            f.client.offer(FRAME, System.nanoTime() / 1000, true);
+            await(() -> f.tcp.writeBlocked);
+            f.client.close();
+            await(() -> !f.tcp.writeBlocked);
+            assertEquals(0, f.failures.get());
+            assertEquals(0, f.client.sentFrames());
+        }
+    }
+
+    private static int firstPacket(byte[] bytes) {
+        String request = new String(bytes, StandardCharsets.ISO_8859_1);
+        int post = request.indexOf("POST /stream HTTP/1.1");
+        int lengthHeader = request.indexOf("Content-Length: ", post);
+        int length = Integer.parseInt(request.substring(lengthHeader + 16, request.indexOf("\r\n", lengthHeader)));
+        return request.indexOf("\r\n\r\n", post) + 4 + length;
     }
 
     @Test public void onlyValidPeerNtpQueriesIncreaseTimingEvidence() throws Exception {
@@ -185,6 +388,17 @@ public class LegacyMirrorClientTest {
         }
     }
 
+    @Test public void socketResetHasAnActionableDisconnectMessage() throws Exception {
+        try (Fixture f = new Fixture()) {
+            f.client.connect(f.endpoint, BINDER);
+            f.tcp.readFailure = true;
+            await(() -> f.failures.get() == 1);
+            assertEquals("接收端已断开或网络连接中断", f.message);
+            assertTrue(f.tcp.closed);
+            assertTrue(f.udp.closed);
+        }
+    }
+
     private static final class Fixture implements AutoCloseable {
         final FakeSocket tcp = new FakeSocket();
         final FakeDatagramSocket udp = new FakeDatagramSocket();
@@ -208,10 +422,19 @@ public class LegacyMirrorClientTest {
         final BlockingQueue<Integer> input = new LinkedBlockingQueue<>();
         final ByteArrayOutputStream output = new ByteArrayOutputStream();
         final CountDownLatch writeEntered = new CountDownLatch(1);
-        volatile boolean closed, blockWrites, connectFailure;
+        final CountDownLatch connectEntered = new CountDownLatch(1);
+        volatile boolean closed, blockWrites, connectFailure, blockConnect, writeBlocked, readFailure;
         volatile int connections;
         @Override public void connect(SocketAddress address, int timeout) throws IOException {
             connections++;
+            connectEntered.countDown();
+            synchronized (output) {
+                while (blockConnect && !closed) {
+                    try { output.wait(); }
+                    catch (InterruptedException error) { Thread.currentThread().interrupt(); throw new IOException(error); }
+                }
+            }
+            if (closed) throw new SocketException("closed");
             if (connectFailure) throw new IOException("connection failed");
         }
         @Override public void setTcpNoDelay(boolean enabled) {}
@@ -219,6 +442,7 @@ public class LegacyMirrorClientTest {
         @Override public InputStream getInputStream() {
             return new InputStream() {
                 public int read() throws IOException {
+                    if (readFailure) throw new SocketException("Connection reset");
                     try {
                         Integer value = input.poll(50, TimeUnit.MILLISECONDS);
                         if (value != null) return value;
@@ -234,9 +458,14 @@ public class LegacyMirrorClientTest {
                 public void write(byte[] bytes, int offset, int length) throws IOException {
                     synchronized (output) {
                         writeEntered.countDown();
-                        while (blockWrites && !closed) {
-                            try { output.wait(); }
-                            catch (InterruptedException error) { Thread.currentThread().interrupt(); throw new IOException(error); }
+                        try {
+                            while (blockWrites && !closed) {
+                                writeBlocked = true;
+                                try { output.wait(); }
+                                catch (InterruptedException error) { Thread.currentThread().interrupt(); throw new IOException(error); }
+                            }
+                        } finally {
+                            writeBlocked = false;
                         }
                         if (closed) throw new SocketException("closed");
                         output.write(bytes, offset, length);

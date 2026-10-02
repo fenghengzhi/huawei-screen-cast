@@ -17,20 +17,22 @@ public final class LelinkEndpoint {
     private static final int MAX_TEXT_BYTES = 255;
     private static final int MAX_TXT_ENTRIES = 64;
     private static final Set<String> METADATA_KEYS = Set.of("version", "ver", "hmd", "features", "width", "height");
-    private static final Set<String> PORT_KEYS = Set.of("lelinkport", "remote", "mirror");
+    private static final Set<String> PORT_KEYS = Set.of("lelinkport", "remote", "mirror", "raop");
 
     private final String name;
     private final InetAddress address;
     private final int controlPort;
     private final OptionalInt mirrorPort;
+    private final OptionalInt raopPort;
     private final Map<String, String> metadata;
 
     private LelinkEndpoint(String name, InetAddress address, int controlPort,
-                           OptionalInt mirrorPort, Map<String, String> metadata) {
+                           OptionalInt mirrorPort, OptionalInt raopPort, Map<String, String> metadata) {
         this.name = name;
         this.address = address;
         this.controlPort = controlPort;
         this.mirrorPort = mirrorPort;
+        this.raopPort = raopPort;
         this.metadata = Map.copyOf(metadata);
     }
 
@@ -60,11 +62,13 @@ public final class LelinkEndpoint {
                 : accepted.containsKey("remote") ? parsePort(accepted.get("remote"), "remote") : srvPort;
         OptionalInt mirrorPort = accepted.containsKey("mirror")
                 ? OptionalInt.of(parsePort(accepted.get("mirror"), "mirror")) : OptionalInt.empty();
+        OptionalInt raopPort = accepted.containsKey("raop")
+                ? OptionalInt.of(parsePort(accepted.get("raop"), "raop")) : OptionalInt.empty();
         Map<String, String> metadata = new LinkedHashMap<>();
         for (String key : METADATA_KEYS) {
             if (accepted.containsKey(key)) metadata.put(key, accepted.get(key));
         }
-        return new LelinkEndpoint(name, address, controlPort, mirrorPort, metadata);
+        return new LelinkEndpoint(name, address, controlPort, mirrorPort, raopPort, metadata);
     }
 
     private static void validateAddress(InetAddress address) {
@@ -124,6 +128,7 @@ public final class LelinkEndpoint {
     public InetAddress address() { return address; }
     public int controlPort() { return controlPort; }
     public OptionalInt mirrorPort() { return mirrorPort; }
+    public OptionalInt raopPort() { return raopPort; }
     public Map<String, String> metadata() { return metadata; }
     public String key() {
         String host = address.getHostAddress();

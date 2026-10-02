@@ -25,6 +25,7 @@ public final class MainActivity extends Activity {
     private String mirrorMode = "ts";
     private CastQuality quality;
     private Button qualityButton;
+    private RadioGroup modes;
     private Dlna.Device permissionTarget;
     private LinearLayout deviceList;
     private WifiManager.MulticastLock multicastLock;
@@ -32,10 +33,14 @@ public final class MainActivity extends Activity {
     private final Handler mainHandler = new Handler(Looper.getMainLooper());
     private final LinkedHashMap<String, String> otherServices = new LinkedHashMap<>();
     private final LinkedHashMap<String, LelinkEndpoint> lelinkDevices = new LinkedHashMap<>();
-    private final ExecutorService probeWorker = Executors.newSingleThreadExecutor();
-    private LelinkProbe currentProbe;
-    private Intent experimentalRequest;
+    private final LinkedHashMap<String, RaopCapabilities> raopServices = new LinkedHashMap<>();
+    private AlertDialog compatibilityDialog;
+    private Intent compatibilityRequest;
     private int scanGeneration;
+    private record DiscoverySnapshot(Map<String, Dlna.Device> devices,
+                                     Map<String, LelinkEndpoint> lelinkDevices,
+                                     Map<String, RaopCapabilities> raopServices,
+                                     Map<String, String> otherServices) {}
     private final BroadcastReceiver updates = new BroadcastReceiver() { @Override public void onReceive(Context context, Intent intent) { updateMedia(); } };
     private int dp(float value) { return Math.round(value * getResources().getDisplayMetrics().density); }
     private GradientDrawable background(int color, int stroke, float radius) { GradientDrawable drawable = new GradientDrawable(); drawable.setColor(color); drawable.setCornerRadius(dp(radius)); if (stroke != 0) drawable.setStroke(dp(1), stroke); return drawable; }
@@ -47,7 +52,14 @@ public final class MainActivity extends Activity {
     @Override public void onCreate(Bundle bundle) {
         super.onCreate(bundle);
         if (bundle != null) mirrorMode = bundle.getString("mirrorMode", "ts");
-        if (bundle != null) experimentalRequest = bundle.getParcelable("experimentalRequest");
+        if (bundle != null) compatibilityRequest = bundle.getParcelable("compatibilityRequest");
+        Object retained = getLastNonConfigurationInstance();
+        if (retained instanceof DiscoverySnapshot snapshot) {
+            devices.putAll(snapshot.devices());
+            lelinkDevices.putAll(snapshot.lelinkDevices());
+            raopServices.putAll(snapshot.raopServices());
+            otherServices.putAll(snapshot.otherServices());
+        }
         SharedPreferences preferences = getSharedPreferences("cast", MODE_PRIVATE);
         quality = new CastQuality(preferences.getInt("height", 540), preferences.getInt("fps", 20), preferences.getInt("kbps", 1200), VideoCodec.fromId(preferences.getString("codec", "h264")));
         getWindow().setStatusBarColor(Color.rgb(246,247,248)); getWindow().setNavigationBarColor(Color.WHITE);
@@ -62,10 +74,10 @@ public final class MainActivity extends Activity {
         LinearLayout mediaHeader = new LinearLayout(this); mediaHeader.setGravity(Gravity.CENTER_VERTICAL);
         TextView mediaTitle = text("接收设备", 18, DARK, true); mediaHeader.addView(mediaTitle, new LinearLayout.LayoutParams(0, -2, 1));
         scanButton = button("搜索", false); mediaHeader.addView(scanButton, new LinearLayout.LayoutParams(dp(72), dp(39))); scanButton.setOnClickListener(v -> scan()); add(root, mediaHeader, 24);
-        add(root, text("DLNA 媒体投屏 · 同时检测乐联 / AirPlay 服务", 11, MUTED, false), 8);
+        add(root, text("DLNA 投屏 · 乐播兼容镜像", 11, MUTED, false), 8);
         scanStatus = text("尚未搜索接收设备", 12, MUTED, false); add(root, scanStatus, 18);
         deviceList = new LinearLayout(this); deviceList.setOrientation(LinearLayout.VERTICAL); add(root, deviceList, 8);
-        RadioGroup modes = new RadioGroup(this); modes.setOrientation(LinearLayout.HORIZONTAL);
+        modes = new RadioGroup(this); modes.setOrientation(LinearLayout.HORIZONTAL);
         RadioButton low = new RadioButton(this); low.setId(View.generateViewId()); low.setText("低延迟"); low.setTextSize(12);
         RadioButton compatible = new RadioButton(this); compatible.setId(View.generateViewId()); compatible.setText("兼容模式"); compatible.setTextSize(12);
         modes.addView(low, new RadioGroup.LayoutParams(0, dp(44), 1)); modes.addView(compatible, new RadioGroup.LayoutParams(0, dp(44), 1)); modes.check("hls".equals(mirrorMode) ? compatible.getId() : low.getId());
@@ -84,11 +96,15 @@ public final class MainActivity extends Activity {
         add(root, text("本地连接 · 无需账号 · 个人使用免费", 10, MUTED, false), 27);
         if (bundle != null) {
             String control = bundle.getString("control");
-            if (control != null) { selected = new Dlna.Device(bundle.getString("id"), bundle.getString("name"), bundle.getString("maker"), control, bundle.getString("type")); devices.put(selected.id().isEmpty() ? selected.controlUrl() : selected.id(), selected); renderDevices(); }
+            if (control != null) { selected = new Dlna.Device(bundle.getString("id"), bundle.getString("name"), bundle.getString("maker"), control, bundle.getString("type")); devices.put(selected.id().isEmpty() ? selected.controlUrl() : selected.id(), selected); }
             if (bundle.getBoolean("projectionPending")) permissionTarget = selected;
         }
+        renderDevices();
+        if (!devices.isEmpty() || !lelinkDevices.isEmpty()) {
+            scanStatus.setText("已发现 " + devices.size() + " 个 DLNA、" + lelinkDevices.size() + " 个乐播兼容镜像接收端");
+        } else if (!otherServices.isEmpty()) scanStatus.setText("已发现其他投屏服务");
         updateMedia(); updateNetwork();
-        if (bundle == null) root.post(this::scan);
+        if (bundle == null && retained == null) root.post(this::scan);
         if (getIntent().hasExtra("description")) root.post(() -> addByAddress(getIntent().getStringExtra("description")));
     }
     private void openMirror() {
@@ -102,7 +118,7 @@ public final class MainActivity extends Activity {
         }
     }
     private void showHelp() {
-        new AlertDialog.Builder(this).setTitle("连接中国电信机顶盒").setMessage("手机与机顶盒连接同一 Wi-Fi，打开机顶盒已有的投屏服务。选择接收设备，点击开始屏幕投屏，并同意系统录屏授权。\n\n本应用通过 DLNA 实时视频流投送屏幕，不需要电视安装应用。若低延迟模式不出画面，结束后切换兼容模式。画面通常会有数秒延迟，具体取决于机顶盒播放器。\n\n当前只传画面。受保护内容可能黑屏。\n\n使用 AirSonic 的录屏编码与 TS 封装组件，Copyright © 2026 Chunguang Wei，PolyForm Noncommercial 1.0.0 许可，仅限非商业用途。").setPositiveButton("知道了", null).setNeutralButton("系统无线投屏", (d,w) -> openMirror()).show();
+        new AlertDialog.Builder(this).setTitle("连接中国电信机顶盒").setMessage("手机与机顶盒连接同一 Wi-Fi，打开机顶盒已有的投屏服务。选择接收设备，点击开始屏幕投屏，并同意系统录屏授权。\n\nDLNA 投屏默认采集系统播放声音，不录制麦克风。若低延迟模式不出画面，结束后切换兼容模式。画面延迟取决于接收端播放器。\n\n乐播兼容镜像使用接收端的 AirPlay 兼容接口，不是完整 Lelink 协议。视频使用 H.264，音频在接收端广播兼容能力时默认启用，只采集系统播放声音、不录制麦克风。未发现兼容音频能力时会确认仅投画面；音频连接失败时会明确提示并停止。使用已保存的分辨率、帧率和码率，不改变 DLNA 的编码选择。不绕过接收端的收费、授权或时长限制。\n\n受保护内容可能黑屏或无声。\n\n使用 AirSonic 的录屏编码与 TS 封装组件，Copyright © 2026 Chunguang Wei，PolyForm Noncommercial 1.0.0 许可，仅限非商业用途。").setPositiveButton("知道了", null).setNeutralButton("系统无线投屏", (d,w) -> openMirror()).show();
     }
     private void updateNetwork() {
         ConnectivityManager manager = getSystemService(ConnectivityManager.class);
@@ -111,10 +127,9 @@ public final class MainActivity extends Activity {
         networkLabel.setText(wifi ? "Wi-Fi 已连接 · 无需电视安装应用" : "请连接与机顶盒相同的 Wi-Fi");
     }
     private void scan() {
-        if (scanning || MirrorService.active || LegacyMirrorService.active || MediaService.state.active()) return;
+        if (scanning || castingBusy()) return;
         int generation = ++scanGeneration;
-        if (currentProbe != null) { currentProbe.close(); currentProbe = null; }
-        scanning = true; devices.clear(); otherServices.clear(); lelinkDevices.clear(); selected = null; renderDevices(); updateMedia(); scanButton.setEnabled(false); scanStatus.setText("正在通过手机网络搜索接收端…");
+        scanning = true; devices.clear(); otherServices.clear(); lelinkDevices.clear(); raopServices.clear(); selected = null; renderDevices(); updateMedia(); scanButton.setEnabled(false); scanStatus.setText("正在通过手机网络搜索接收端…");
         WifiManager wifi = (WifiManager) getApplicationContext().getSystemService(WIFI_SERVICE);
         multicastLock = wifi.createMulticastLock("HuaweiCast:discovery"); multicastLock.setReferenceCounted(false);
         try { multicastLock.acquire(); } catch (Exception error) { scanning = false; scanButton.setEnabled(true); scanStatus.setText("无法启用组播搜索：" + error.getMessage()); return; }
@@ -126,15 +141,26 @@ public final class MainActivity extends Activity {
                 String protocol = info.getServiceType().contains("leboremote") ? "乐联" : "AirPlay";
                 String name = info.getServiceName();
                 for (String key : new String[]{"name", "fn", "deviceName"}) { byte[] value = info.getAttributes().get(key); if (value != null) { name = new String(value, java.nio.charset.StandardCharsets.UTF_8); break; } }
-                String address = info.getHost() == null ? "" : info.getHost().getHostAddress();
-                android.util.Log.i("HuaweiCastDiscovery", "mDNS: " + name + " " + protocol + " " + address + ":" + info.getPort() + " attrs=" + info.getAttributes().keySet());
                 if (name.contains("@")) name = name.substring(name.indexOf('@') + 1);
+                String address = info.getHost() == null ? "" : info.getHost().getHostAddress();
+                if (info.getServiceType().contains("_raop.")) {
+                    String key = raopKey(info.getHost(), info.getPort());
+                    if (key != null) {
+                        try { raopServices.put(key, RaopCapabilities.from(info.getAttributes())); }
+                        catch (IllegalArgumentException error) {
+                            raopServices.remove(key);
+                            android.util.Log.w("HuaweiCastDiscovery", "忽略无效 RAOP 能力广播: " + error.getMessage());
+                        }
+                    }
+                }
+                android.util.Log.i("HuaweiCastDiscovery", "mDNS: " + name + " " + protocol + " " + address + ":" + info.getPort() + " attrs=" + info.getAttributes().keySet());
                 if (protocol.equals("乐联")) {
                     try {
                         LelinkEndpoint endpoint = LelinkEndpoint.from(name, info.getHost(), info.getPort(), info.getAttributes());
                         lelinkDevices.put(endpoint.key(), endpoint);
                     } catch (IllegalArgumentException error) { android.util.Log.w("HuaweiCastDiscovery", "忽略无效乐联广播: " + error.getMessage()); }
-                } else otherServices.put(address + info.getServiceType(), name + "\n" + protocol + " · 已发现服务，未接入此协议");
+                } else otherServices.put(address + info.getServiceType(), name + "\n" + protocol
+                        + (info.getServiceType().contains("_raop.") ? " · 已发现音频服务" : " · 已发现服务，未接入此协议"));
                 renderDevices();
             }
         });
@@ -143,7 +169,7 @@ public final class MainActivity extends Activity {
             if (destroyed || generation != scanGeneration) return;
             if (serviceDiscovery != null) serviceDiscovery.stop();
             if (multicastLock != null && multicastLock.isHeld()) multicastLock.release();
-            scanning = false; scanButton.setEnabled(true);
+            scanning = false; updateMedia();
         }, 12000);
         scanner.execute(() -> {
             String failure = null;
@@ -166,7 +192,7 @@ public final class MainActivity extends Activity {
             runOnUiThread(() -> {
                 if (destroyed || generation != scanGeneration) return;
                 scanStatus.setText(result != null ? "搜索失败：" + result : devices.isEmpty() ? "未发现 DLNA，正在继续检测其他投屏协议。" : "已发现 " + devices.size() + " 个 DLNA 接收端，请选择设备");
-                mainHandler.postDelayed(() -> { if (!destroyed && generation == scanGeneration && devices.isEmpty()) scanStatus.setText(otherServices.isEmpty() && lelinkDevices.isEmpty() ? "未发现接收端，请确认机顶盒投屏服务已打开。" : "未发现 DLNA，可检测已发现的乐联服务。" ); }, 6500);
+                mainHandler.postDelayed(() -> { if (!destroyed && generation == scanGeneration && devices.isEmpty()) scanStatus.setText(otherServices.isEmpty() && lelinkDevices.isEmpty() ? "未发现接收端，请确认机顶盒投屏服务已打开。" : "未发现 DLNA，可尝试已发现的乐播兼容镜像接收端。" ); }, 6500);
             });
         });
     }
@@ -175,20 +201,20 @@ public final class MainActivity extends Activity {
         for (Dlna.Device device : devices.values()) {
             RadioButton row = new RadioButton(this); row.setText(device.name() + "\nDLNA 接收端"); row.setTextSize(13); row.setTextColor(DARK); row.setPadding(dp(10),dp(14),dp(10),dp(14)); row.setBackground(background(Color.WHITE, LINE, 5));
             row.setChecked(selected != null && selected.controlUrl().equals(device.controlUrl()));
+            row.setEnabled(!castingBusy());
             row.setOnClickListener(v -> { selected = device; renderDevices(); updateMedia(); }); add(deviceList, row, 7);
         }
         if (devices.isEmpty()) for (String description : otherServices.values()) {
             TextView row = text(description, 12, MUTED, false); row.setPadding(dp(12), dp(12), dp(12), dp(12)); row.setBackground(background(Color.WHITE, LINE, 5)); add(deviceList, row, 7);
         }
         for (LelinkEndpoint endpoint : lelinkDevices.values()) {
-            Button row = button(endpoint.title() + "\n乐联协议实验", false);
-            row.setEnabled(!MirrorService.active && !LegacyMirrorService.active && !MediaService.state.active());
-            row.setOnClickListener(v -> probeLelink(endpoint)); add(deviceList, row, 7);
+            Button row = button(endpoint.title() + "\n乐播兼容镜像 · 开始投屏", false);
+            row.setEnabled(!castingBusy());
+            row.setOnClickListener(v -> prepareCompatibleMirror(endpoint)); add(deviceList, row, 7);
         }
     }
-    private void probeLelink(LelinkEndpoint endpoint) {
-        if (MirrorService.active || LegacyMirrorService.active || MediaService.state.active()) return;
-        if (currentProbe != null) currentProbe.close();
+    private void prepareCompatibleMirror(LelinkEndpoint endpoint) {
+        if (castingBusy()) return;
         ConnectivityManager manager = getSystemService(ConnectivityManager.class);
         Network wifi = null;
         for (Network network : manager.getAllNetworks()) {
@@ -196,63 +222,117 @@ public final class MainActivity extends Activity {
             if (caps != null && caps.hasTransport(NetworkCapabilities.TRANSPORT_WIFI)) { wifi = network; break; }
         }
         if (wifi == null) { Toast.makeText(this, "请连接 Wi-Fi", Toast.LENGTH_SHORT).show(); return; }
-        Network probeNetwork = wifi;
-        LelinkProbe probe = new LelinkProbe(probeNetwork::bindSocket); currentProbe = probe;
-        AlertDialog progress = new AlertDialog.Builder(this).setTitle(endpoint.title()).setMessage("正在检测乐联广播和兼容镜像接口…")
-            .setNegativeButton("取消", (d,w) -> { probe.close(); if (currentProbe == probe) currentProbe = null; }).create();
-        progress.setOnCancelListener(d -> { probe.close(); if (currentProbe == probe) currentProbe = null; }); progress.show();
-        probeWorker.execute(() -> {
-            LelinkProbe.Report report = probe.inspect(endpoint);
-            runOnUiThread(() -> {
-                if (destroyed || currentProbe != probe) return;
-                currentProbe = null; probe.close(); progress.dismiss();
-                AlertDialog.Builder result = new AlertDialog.Builder(this).setTitle("乐联协议实验").setMessage(report.summary()
-                    + "\n\n实验为旧版 AirPlay 兼容接口，不是完整 Lelink。固定 H.264 / 540p / 20 fps，不含声音、不加密，30 秒后自动停止。接收端可能收费或限时。正常 DLNA 投屏不受影响。")
-                    .setNegativeButton("关闭", null);
-                if (report.legacyMirrorAvailable()) result.setPositiveButton("测试 30 秒", (d,w) -> {
-                    experimentalRequest = new Intent(this, LegacyMirrorService.class).putExtra("host", endpoint.address().getHostAddress())
-                        .putExtra("name", endpoint.name()).putExtra("control", endpoint.controlPort()).putExtra("mirror", endpoint.mirrorPort().getAsInt());
-                    startActivityForResult(getSystemService(android.media.projection.MediaProjectionManager.class).createScreenCaptureIntent(), 12);
-                });
-                result.show();
-            });
-        });
+        if (endpoint.mirrorPort().isEmpty()) {
+            showCompatibilityDialog(new AlertDialog.Builder(this).setTitle("乐播兼容镜像暂不可用")
+                .setMessage("接收端未广播镜像端口，无法开始兼容镜像。")
+                .setPositiveButton("关闭", null).create());
+            return;
+        }
+        // /stream.xml can open the receiver's player. Only contact it after projection consent.
+        CastQuality compatibleQuality = new CastQuality(quality.height(), quality.fps(), quality.kbps(), VideoCodec.H264);
+        RaopCapabilities audio = audioCapabilities(endpoint);
+        boolean audioEligible = audio != null && audio.eligible();
+        String audioNote = audioEligible ? "默认尝试采集并传送系统播放声音，不录制麦克风；音频连接失败时会明确提示并停止。"
+                : "本次仅画面：" + audioUnavailableReason(endpoint, audio) + "。";
+        SharedPreferences preferences = getSharedPreferences("cast", MODE_PRIVATE);
+        if (audioEligible && preferences.getBoolean("leboCompatibilityAudioNotice", false)) {
+            requestCompatibleMirror(endpoint, compatibleQuality);
+            return;
+        }
+        showCompatibilityDialog(new AlertDialog.Builder(this).setTitle("乐播兼容镜像").setMessage(
+            "通过接收端的 AirPlay 兼容接口传送 H.264 画面。" + audioNote + "这不是完整 Lelink 协议，不绕过接收端的收费、授权或时长限制。音视频在局域网明文传输。\n\n本次画质："
+            + compatibleQuality.summary() + "\n使用已保存的画质参数；DLNA 编码选择保持不变。")
+            .setNegativeButton("取消", null).setPositiveButton("开始投屏", (d,w) -> {
+                preferences.edit().putBoolean("leboCompatibilityAudioNotice", true).apply();
+                requestCompatibleMirror(endpoint, compatibleQuality);
+            }).create());
+    }
+    private void showCompatibilityDialog(AlertDialog dialog) {
+        if (compatibilityDialog != null) compatibilityDialog.dismiss();
+        compatibilityDialog = dialog;
+        dialog.setOnDismissListener(d -> { if (compatibilityDialog == dialog) compatibilityDialog = null; });
+        dialog.show();
+    }
+    private void requestCompatibleMirror(LelinkEndpoint endpoint, CastQuality compatibleQuality) {
+        if (castingBusy()) return;
+        RaopCapabilities audio = audioCapabilities(endpoint);
+        boolean audioEligible = audio != null && audio.eligible();
+        compatibilityRequest = LegacyMirrorService.startIntent(this, endpoint, compatibleQuality)
+                .putExtra("audioEligible", audioEligible)
+                .putExtra("audioRate", audioEligible ? audio.sampleRate() : 0)
+                .putExtra("audioUnavailableReason", audioEligible ? "" : audioUnavailableReason(endpoint, audio));
+        updateMedia();
+        if (audioEligible && checkSelfPermission(Manifest.permission.RECORD_AUDIO) != android.content.pm.PackageManager.PERMISSION_GRANTED) {
+            requestPermissions(new String[]{Manifest.permission.RECORD_AUDIO}, 21);
+            return;
+        }
+        requestCompatibleProjection();
+    }
+    private static String raopKey(java.net.InetAddress host, int port) {
+        return host == null || port < 1 || port > 65535 ? null : host.getHostAddress() + ":" + port;
+    }
+    private RaopCapabilities audioCapabilities(LelinkEndpoint endpoint) {
+        return endpoint.raopPort().isPresent()
+                ? raopServices.get(raopKey(endpoint.address(), endpoint.raopPort().getAsInt())) : null;
+    }
+    private String audioUnavailableReason(LelinkEndpoint endpoint, RaopCapabilities audio) {
+        if (endpoint.raopPort().isEmpty()) return "接收端未广播音频端口";
+        return audio == null ? "未发现同一接收端的兼容音频能力广播" : audio.unsupportedReason();
+    }
+    private void requestCompatibleProjection() {
+        if (compatibilityRequest == null) return;
+        try { startActivityForResult(getSystemService(android.media.projection.MediaProjectionManager.class).createScreenCaptureIntent(), 12); }
+        catch (ActivityNotFoundException | SecurityException error) {
+            compatibilityRequest = null; updateMedia();
+            Toast.makeText(this, "无法请求屏幕共享授权", Toast.LENGTH_LONG).show();
+        }
     }
     private void chooseMedia() {
-        if (selected == null) return;
+        if (selected == null || castingBusy()) return;
         LegacyMirrorService.status = "";
         Intent intent = new Intent(Intent.ACTION_OPEN_DOCUMENT); intent.addCategory(Intent.CATEGORY_OPENABLE); intent.setType("*/*"); intent.putExtra(Intent.EXTRA_MIME_TYPES, new String[]{"image/*", "video/*", "audio/*"});
         try { startActivityForResult(intent, 10); } catch (ActivityNotFoundException error) { Toast.makeText(this, "未找到文件选择器", Toast.LENGTH_LONG).show(); }
     }
     private void startMirror() {
-        if (selected == null || MirrorService.active || LegacyMirrorService.active || MediaService.state.active()) return;
+        if (selected == null || castingBusy()) return;
         LegacyMirrorService.status = "";
         if (checkSelfPermission(Manifest.permission.RECORD_AUDIO) != android.content.pm.PackageManager.PERMISSION_GRANTED) {
             requestPermissions(new String[]{Manifest.permission.RECORD_AUDIO}, 21);
             return;
         }
         permissionTarget = selected;
-        mirrorButton.setEnabled(false);
-        startActivityForResult(getSystemService(android.media.projection.MediaProjectionManager.class).createScreenCaptureIntent(), 11);
+        updateMedia();
+        try { startActivityForResult(getSystemService(android.media.projection.MediaProjectionManager.class).createScreenCaptureIntent(), 11); }
+        catch (ActivityNotFoundException | SecurityException error) {
+            permissionTarget = null; updateMedia();
+            Toast.makeText(this, "无法请求屏幕共享授权", Toast.LENGTH_LONG).show();
+        }
     }
     @Override public void onRequestPermissionsResult(int request, String[] permissions, int[] results) {
         super.onRequestPermissionsResult(request, permissions, results);
         if (request == 21) {
-            if (results.length > 0 && results[0] == android.content.pm.PackageManager.PERMISSION_GRANTED) startMirror();
-            else Toast.makeText(this, "投屏需要录音权限以采集系统声音，请在应用权限设置中允许。不会录制麦克风。", Toast.LENGTH_LONG).show();
+            if (results.length > 0 && results[0] == android.content.pm.PackageManager.PERMISSION_GRANTED) {
+                if (compatibilityRequest != null) requestCompatibleProjection();
+                else startMirror();
+            } else {
+                compatibilityRequest = null; updateMedia();
+                Toast.makeText(this, "未授权系统声音采集，本次投屏已取消。请允许录音权限后重试；不会录制麦克风。", Toast.LENGTH_LONG).show();
+            }
         }
     }
     @Override protected void onActivityResult(int request, int result, Intent data) {
         super.onActivityResult(request, result, data);
         if (request == 12) {
-            Intent service = experimentalRequest; experimentalRequest = null;
-            if (result == RESULT_OK && data != null && service != null) startForegroundService(service.putExtra("permission", data));
-            else Toast.makeText(this, "实验镜像未授权", Toast.LENGTH_SHORT).show();
+            Intent service = compatibilityRequest; compatibilityRequest = null;
+            if (result == RESULT_OK && data != null && service != null) {
+                if (Build.VERSION.SDK_INT >= 33 && checkSelfPermission(Manifest.permission.POST_NOTIFICATIONS) != android.content.pm.PackageManager.PERMISSION_GRANTED) requestPermissions(new String[]{Manifest.permission.POST_NOTIFICATIONS}, 20);
+                startForegroundService(service.putExtra("permission", data));
+            } else { updateMedia(); Toast.makeText(this, "未授权屏幕共享", Toast.LENGTH_SHORT).show(); }
             return;
         }
         if (request == 11) {
-            if (result != RESULT_OK || data == null || permissionTarget == null) { updateMedia(); Toast.makeText(this, "未授权屏幕共享", Toast.LENGTH_SHORT).show(); return; }
             Dlna.Device target = permissionTarget; permissionTarget = null;
+            if (result != RESULT_OK || data == null || target == null) { updateMedia(); Toast.makeText(this, "未授权屏幕共享", Toast.LENGTH_SHORT).show(); return; }
             if (Build.VERSION.SDK_INT >= 33 && checkSelfPermission(Manifest.permission.POST_NOTIFICATIONS) != android.content.pm.PackageManager.PERMISSION_GRANTED) requestPermissions(new String[]{Manifest.permission.POST_NOTIFICATIONS}, 20);
             Intent service = new Intent(this, MirrorService.class).putExtra("permission", data).putExtra("mode", mirrorMode).putExtra("height", quality.height()).putExtra("fps", quality.fps()).putExtra("kbps", quality.kbps()).putExtra("codec", quality.codec().id());
             service.putExtra("id", target.id()).putExtra("device", target.name()).putExtra("control", target.controlUrl()).putExtra("type", target.serviceType()); startForegroundService(service); return;
@@ -275,26 +355,40 @@ public final class MainActivity extends Activity {
     private void updateMedia() {
         MediaService.State state = MediaService.state;
         boolean active = state.active() || MirrorService.active || LegacyMirrorService.active;
-        mirrorNote.setText(LegacyMirrorService.active ? "实验镜像 · H.264 / 540p / 20 fps · 仅画面" : "系统声音已开启 · 不录制麦克风");
+        boolean busy = castingBusy();
+        mirrorNote.setText(LegacyMirrorService.active ? "乐播兼容镜像 · " + LegacyMirrorService.details : "系统声音已开启 · 不录制麦克风");
         mediaStatus.setText(MirrorService.active || (!MirrorService.status.isEmpty() && !state.active()) ? MirrorService.deviceName + "\n" + MirrorService.status : state.status().isEmpty() ? "尚未开始投屏" : state.title() + "\n" + state.device() + " · " + state.status());
         if (LegacyMirrorService.active || (!LegacyMirrorService.status.isEmpty() && !MirrorService.active && !state.active())) mediaStatus.setText(LegacyMirrorService.status);
-        mirrorButton.setEnabled(selected != null && !active); chooseButton.setEnabled(selected != null && !active); scanButton.setEnabled(!active && !scanning); pauseButton.setEnabled(state.active()); stopButton.setEnabled(active); pauseButton.setText(state.paused() ? "继续播放" : "暂停");
+        mirrorButton.setEnabled(selected != null && !busy); chooseButton.setEnabled(selected != null && !busy); scanButton.setEnabled(!busy && !scanning); pauseButton.setEnabled(state.active()); stopButton.setEnabled(active); pauseButton.setText(state.paused() ? "继续播放" : "暂停");
+        qualityButton.setEnabled(!busy);
+        qualityButton.setAlpha(busy ? 0.5f : 1f);
+        for (int i = 0; i < modes.getChildCount(); i++) modes.getChildAt(i).setEnabled(!busy);
+        for (int i = 0; i < deviceList.getChildCount(); i++) deviceList.getChildAt(i).setEnabled(!busy);
+    }
+    private boolean castingBusy() {
+        return MirrorService.active || LegacyMirrorService.active || MediaService.state.active()
+            || compatibilityRequest != null || permissionTarget != null;
     }
     @Override protected void onStart() { super.onStart(); registerReceiver(updates, new IntentFilter(MediaService.UPDATE), "com.local.huaweicast.INTERNAL", null, Build.VERSION.SDK_INT >= 33 ? Context.RECEIVER_NOT_EXPORTED : 0); updateMedia(); updateNetwork(); }
     @Override protected void onStop() { unregisterReceiver(updates); super.onStop(); }
-    @Override protected void onSaveInstanceState(Bundle bundle) { super.onSaveInstanceState(bundle); bundle.putParcelable("experimentalRequest", experimentalRequest); bundle.putString("mirrorMode", mirrorMode); bundle.putBoolean("projectionPending", permissionTarget != null); if (selected != null) { bundle.putString("id", selected.id()); bundle.putString("name", selected.name()); bundle.putString("maker", selected.manufacturer()); bundle.putString("control", selected.controlUrl()); bundle.putString("type", selected.serviceType()); } }
+    @Override public Object onRetainNonConfigurationInstance() {
+        return new DiscoverySnapshot(new LinkedHashMap<>(devices), new LinkedHashMap<>(lelinkDevices), new LinkedHashMap<>(raopServices), new LinkedHashMap<>(otherServices));
+    }
+    @Override protected void onSaveInstanceState(Bundle bundle) { super.onSaveInstanceState(bundle); bundle.putParcelable("compatibilityRequest", compatibilityRequest); bundle.putString("mirrorMode", mirrorMode); bundle.putBoolean("projectionPending", permissionTarget != null); if (selected != null) { bundle.putString("id", selected.id()); bundle.putString("name", selected.name()); bundle.putString("maker", selected.manufacturer()); bundle.putString("control", selected.controlUrl()); bundle.putString("type", selected.serviceType()); } }
     private void editQuality() {
+        if (castingBusy()) return;
         LinearLayout content = new LinearLayout(this); content.setOrientation(LinearLayout.VERTICAL); content.setPadding(dp(24), dp(8), dp(24), dp(12));
         add(content, text("编码格式", 13, DARK, true), 8);
         Spinner codec = new Spinner(this);
         codec.setAdapter(new ArrayAdapter<>(this, android.R.layout.simple_spinner_dropdown_item, new String[]{"H.264 / AVC", "H.265 / HEVC"}));
         codec.setSelection(quality.codec() == VideoCodec.H265 ? 1 : 0); add(content, codec, 8);
-        add(content, text("H.265 需手机硬件编码器和接收端同时支持。", 11, MUTED, false), 6);
+        add(content, text("H.265 需手机硬件编码器和接收端同时支持。乐播兼容镜像仅使用 H.264，不改变此处选择。", 11, MUTED, false), 6);
         add(content, text("分辨率", 13, DARK, true), 8);
         Spinner resolution = new Spinner(this);
-        resolution.setAdapter(new ArrayAdapter<>(this, android.R.layout.simple_spinner_dropdown_item, new String[]{"360p · 640 × 360", "540p · 960 × 540", "720p · 1280 × 720", "1080p · 1920 × 1080"}));
+        resolution.setAdapter(new ArrayAdapter<>(this, android.R.layout.simple_spinner_dropdown_item, new String[]{"360p · 最大 640 × 360", "540p · 最大 960 × 540", "720p · 最大 1280 × 720", "1080p · 最大 1920 × 1080"}));
         for (int i=0; i<CastQuality.HEIGHTS.length; i++) if (CastQuality.HEIGHTS[i] == quality.height()) resolution.setSelection(i);
         add(content, resolution, 8);
+        add(content, text("乐播兼容镜像保持屏幕比例，竖屏时宽高互换。", 11, MUTED, false), 6);
         add(content, text("帧率", 13, DARK, true), 16);
         Spinner rate = new Spinner(this); rate.setAdapter(new ArrayAdapter<>(this, android.R.layout.simple_spinner_dropdown_item, new String[]{"15 fps", "20 fps", "25 fps", "30 fps", "60 fps"}));
         for (int i=0; i<CastQuality.FRAME_RATES.length; i++) if (CastQuality.FRAME_RATES[i] == quality.fps()) rate.setSelection(i);
@@ -318,7 +412,14 @@ public final class MainActivity extends Activity {
         dialog.setOnShowListener(d -> dialog.getButton(AlertDialog.BUTTON_NEUTRAL).setOnClickListener(v -> { codec.setSelection(0); resolution.setSelection(1); rate.setSelection(1); bitrate.setProgress(7); }));
         dialog.show();
     }
-    @Override protected void onDestroy() { destroyed = true; if (currentProbe != null) currentProbe.close(); probeWorker.shutdownNow(); scanner.shutdownNow(); mainHandler.removeCallbacksAndMessages(null); if (serviceDiscovery != null) serviceDiscovery.stop(); if (multicastLock != null && multicastLock.isHeld()) multicastLock.release(); super.onDestroy(); }
+    @Override protected void onDestroy() {
+        destroyed = true;
+        if (compatibilityDialog != null) { compatibilityDialog.dismiss(); compatibilityDialog = null; }
+        scanner.shutdownNow(); mainHandler.removeCallbacksAndMessages(null);
+        if (serviceDiscovery != null) serviceDiscovery.stop();
+        if (multicastLock != null && multicastLock.isHeld()) multicastLock.release();
+        super.onDestroy();
+    }
     private final class ScreenArt extends View {
         private final Paint paint = new Paint(Paint.ANTI_ALIAS_FLAG);
         ScreenArt(Context context) { super(context); setMinimumHeight(dp(110)); setBackground(background(Color.rgb(32,43,48), 0, 7)); }
