@@ -41,7 +41,7 @@ public final class MirrorService extends Service {
             WifiManager wifi = (WifiManager) getApplicationContext().getSystemService(WIFI_SERVICE);
             wifiLock = wifi.createWifiLock(WifiManager.WIFI_MODE_FULL_HIGH_PERF, "HuaweiCast:mirror"); wifiLock.acquire();
             engine = new MirrorEngine();
-            CastQuality quality = new CastQuality(intent.getIntExtra("height", 540), intent.getIntExtra("fps", 20), intent.getIntExtra("kbps", 1200));
+            CastQuality quality = new CastQuality(intent.getIntExtra("height", 540), intent.getIntExtra("fps", 20), intent.getIntExtra("kbps", 1200), VideoCodec.fromId(intent.getStringExtra("codec")));
             android.util.Log.i("HuaweiCastMirror", "quality=" + quality.summary());
             if (!engine.start(projection, getResources().getDisplayMetrics().densityDpi, quality)) throw new IllegalStateException(engine.error());
             startedAt = System.currentTimeMillis(); publish("正在生成实时画面…");

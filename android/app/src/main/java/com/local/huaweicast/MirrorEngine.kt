@@ -11,6 +11,7 @@ class MirrorEngine {
             width = quality.width(), height = quality.height(),
             dpi = dpi, bitRate = quality.bitRate(),
             frameRate = quality.fps(), iFrameIntervalSec = 1,
+            videoCodec = quality.codec(),
             emit = { server.emit(it) },
             onSegmentBoundary = { server.boundary(it) },
             syncFrameIntervalMs = 1000

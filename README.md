@@ -28,6 +28,8 @@
 
 ## 构建与测试
 
+1.4.0 在“画质设置”新增 H.264 / AVC 与 H.265 / HEVC。默认 H.264，历史配置自动沿用；编码选择与分辨率等设置一并保存，并于下次投屏生效。H.265 使用 `video/hevc` 硬件编码器、MPEG-TS HEVC 流类型和 VPS/SPS/PPS 参数集。不支持相应硬件编码器时会明确报错，不会静默改成其他编码。接收端需支持所选编码在 MPEG-TS / HLS 中的播放，兼容性不佳时可切回 H.264。
+
 1.3.0 新增“画质设置”：分辨率可选 360p / 540p / 720p / 1080p，帧率可选 15 / 20 / 25 / 30 / 60 fps，码率为 0.5–12 Mbps、步进 0.1 Mbps。设置保存到手机本地，下次开始投屏时应用；取消不修改已有设置，恢复默认后点击保存即可回到 540p / 20 fps / 1.2 Mbps。硬件不支持的编码组合会显示启动错误，不保证每台手机都能达到所有组合。GPU 固定帧率调度保留了 30 / 60 fps 的小数毫秒间隔，避免整数除法造成时钟偏差。
 
 需要 JDK 17+ 和 Android SDK 36：
@@ -47,7 +49,7 @@ GitHub Actions 会在主分支和 Pull Request 自动运行构建、测试与 Li
 
 ## 实现
 
-`MediaProjection → VirtualDisplay → SurfaceTexture → EGL 固定帧率渲染 → MediaCodec H.264 → MPEG-TS → 本地 HTTP / HLS → DLNA AVTransport → 接收端播放器`。
+`MediaProjection → VirtualDisplay → SurfaceTexture → EGL 固定帧率渲染 → MediaCodec H.264/H.265 → MPEG-TS → 本地 HTTP / HLS → DLNA AVTransport → 接收端播放器`。
 
 可使用 `node tools/inspect-stream.mjs <当前直播 URL> 20` 检查 TS 连续性、出帧时间戳与网络到达间隔。工具仅输出统计，不保存屏幕内容；新增直播连接会请求下一个关键帧。
 

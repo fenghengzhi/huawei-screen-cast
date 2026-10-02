@@ -2,7 +2,7 @@
 
 `com.airsonic.sender.screen.ScreenMirrorCaster` and `com.airsonic.sender.streaming.TsMuxer`, and the latter's tests, come from [Chunguang Wei's AirSonic](https://github.com/chunguangwei/AirSonic), commit `97e98120686c0d96673e7f3138956450ee6c486c`.
 
-Local changes to ScreenMirrorCaster: feed its input through a fixed-rate EGL renderer, disable B frames, request real-time priority, and explicitly release the renderer and encoder input surface. TsMuxer and its tests are unchanged.
+Local changes to ScreenMirrorCaster: feed its input through a fixed-rate EGL renderer, disable B frames, request real-time priority, release the renderer and encoder input surface, select H.264/H.265 hardware encoders, and collect codec-specific parameter sets by NAL type. TsMuxer adds HEVC stream type 0x24, VPS/SPS/PPS insertion and a HEVC access-unit delimiter. Original TsMuxer tests are unchanged; additional codec regression tests are part of this project.
 
 Required Notice: Copyright (c) 2026 Chunguang Wei (https://github.com/chunguangwei).
 

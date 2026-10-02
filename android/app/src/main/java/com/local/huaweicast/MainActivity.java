@@ -43,7 +43,7 @@ public final class MainActivity extends Activity {
         super.onCreate(bundle);
         if (bundle != null) mirrorMode = bundle.getString("mirrorMode", "ts");
         SharedPreferences preferences = getSharedPreferences("cast", MODE_PRIVATE);
-        quality = new CastQuality(preferences.getInt("height", 540), preferences.getInt("fps", 20), preferences.getInt("kbps", 1200));
+        quality = new CastQuality(preferences.getInt("height", 540), preferences.getInt("fps", 20), preferences.getInt("kbps", 1200), VideoCodec.fromId(preferences.getString("codec", "h264")));
         getWindow().setStatusBarColor(Color.rgb(246,247,248)); getWindow().setNavigationBarColor(Color.WHITE);
         ScrollView scroll = new ScrollView(this); scroll.setFillViewport(true); scroll.setBackgroundColor(Color.rgb(246,247,248));
         LinearLayout root = new LinearLayout(this); root.setOrientation(LinearLayout.VERTICAL); root.setPadding(dp(24), dp(20), dp(24), dp(28)); scroll.addView(root); setContentView(scroll);
@@ -182,7 +182,7 @@ public final class MainActivity extends Activity {
             if (result != RESULT_OK || data == null || permissionTarget == null) { updateMedia(); Toast.makeText(this, "未授权屏幕共享", Toast.LENGTH_SHORT).show(); return; }
             Dlna.Device target = permissionTarget; permissionTarget = null;
             if (Build.VERSION.SDK_INT >= 33 && checkSelfPermission(Manifest.permission.POST_NOTIFICATIONS) != android.content.pm.PackageManager.PERMISSION_GRANTED) requestPermissions(new String[]{Manifest.permission.POST_NOTIFICATIONS}, 20);
-            Intent service = new Intent(this, MirrorService.class).putExtra("permission", data).putExtra("mode", mirrorMode).putExtra("height", quality.height()).putExtra("fps", quality.fps()).putExtra("kbps", quality.kbps());
+            Intent service = new Intent(this, MirrorService.class).putExtra("permission", data).putExtra("mode", mirrorMode).putExtra("height", quality.height()).putExtra("fps", quality.fps()).putExtra("kbps", quality.kbps()).putExtra("codec", quality.codec().id());
             service.putExtra("id", target.id()).putExtra("device", target.name()).putExtra("control", target.controlUrl()).putExtra("type", target.serviceType()); startForegroundService(service); return;
         }
         if (request != 10 || result != RESULT_OK || data == null || data.getData() == null || selected == null) return;
@@ -211,6 +211,11 @@ public final class MainActivity extends Activity {
     @Override protected void onSaveInstanceState(Bundle bundle) { super.onSaveInstanceState(bundle); bundle.putString("mirrorMode", mirrorMode); bundle.putBoolean("projectionPending", permissionTarget != null); if (selected != null) { bundle.putString("id", selected.id()); bundle.putString("name", selected.name()); bundle.putString("maker", selected.manufacturer()); bundle.putString("control", selected.controlUrl()); bundle.putString("type", selected.serviceType()); } }
     private void editQuality() {
         LinearLayout content = new LinearLayout(this); content.setOrientation(LinearLayout.VERTICAL); content.setPadding(dp(24), dp(8), dp(24), dp(12));
+        add(content, text("编码格式", 13, DARK, true), 8);
+        Spinner codec = new Spinner(this);
+        codec.setAdapter(new ArrayAdapter<>(this, android.R.layout.simple_spinner_dropdown_item, new String[]{"H.264 / AVC", "H.265 / HEVC"}));
+        codec.setSelection(quality.codec() == VideoCodec.H265 ? 1 : 0); add(content, codec, 8);
+        add(content, text("H.265 需手机硬件编码器和接收端同时支持。", 11, MUTED, false), 6);
         add(content, text("分辨率", 13, DARK, true), 8);
         Spinner resolution = new Spinner(this);
         resolution.setAdapter(new ArrayAdapter<>(this, android.R.layout.simple_spinner_dropdown_item, new String[]{"360p · 640 × 360", "540p · 960 × 540", "720p · 1280 × 720", "1080p · 1920 × 1080"}));
@@ -232,11 +237,11 @@ public final class MainActivity extends Activity {
         add(content, text("0.5–12 Mbps · 实际帧率与画质取决于手机、网络和接收端。", 11, MUTED, false), 6);
         ScrollView viewport = new ScrollView(this); viewport.addView(content);
         AlertDialog dialog = new AlertDialog.Builder(this).setTitle("画质设置").setView(viewport).setNegativeButton("取消", null).setNeutralButton("恢复默认", null).setPositiveButton("保存", (d,w) -> {
-            quality = new CastQuality(CastQuality.HEIGHTS[resolution.getSelectedItemPosition()], CastQuality.FRAME_RATES[rate.getSelectedItemPosition()], 500 + bitrate.getProgress()*100);
-            getSharedPreferences("cast", MODE_PRIVATE).edit().putInt("height", quality.height()).putInt("fps", quality.fps()).putInt("kbps", quality.kbps()).apply();
+            quality = new CastQuality(CastQuality.HEIGHTS[resolution.getSelectedItemPosition()], CastQuality.FRAME_RATES[rate.getSelectedItemPosition()], 500 + bitrate.getProgress()*100, codec.getSelectedItemPosition() == 1 ? VideoCodec.H265 : VideoCodec.H264);
+            getSharedPreferences("cast", MODE_PRIVATE).edit().putInt("height", quality.height()).putInt("fps", quality.fps()).putInt("kbps", quality.kbps()).putString("codec", quality.codec().id()).apply();
             qualityButton.setText("画质设置\n" + quality.summary());
         }).create();
-        dialog.setOnShowListener(d -> dialog.getButton(AlertDialog.BUTTON_NEUTRAL).setOnClickListener(v -> { resolution.setSelection(1); rate.setSelection(1); bitrate.setProgress(7); }));
+        dialog.setOnShowListener(d -> dialog.getButton(AlertDialog.BUTTON_NEUTRAL).setOnClickListener(v -> { codec.setSelection(0); resolution.setSelection(1); rate.setSelection(1); bitrate.setProgress(7); }));
         dialog.show();
     }
     @Override protected void onDestroy() { destroyed = true; scanner.shutdownNow(); mainHandler.removeCallbacksAndMessages(null); if (serviceDiscovery != null) serviceDiscovery.stop(); if (multicastLock != null && multicastLock.isHeld()) multicastLock.release(); super.onDestroy(); }

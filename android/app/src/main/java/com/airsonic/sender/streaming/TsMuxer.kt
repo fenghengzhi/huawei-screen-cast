@@ -4,10 +4,12 @@
 
 package com.airsonic.sender.streaming
 
+import com.local.huaweicast.VideoCodec
+
 /**
  * 最小 MPEG-TS 封包器（纯 Kotlin、无 Android 依赖，JVM 可单测）。
  *
- * 把 H.264 Annex-B access unit 打包成 188B TS 包流，供 LiveAudioHttpServer 以
+ * 把 H.264/H.265 Annex-B access unit 打包成 188B TS 包流，供 LiveAudioHttpServer 以
  * `video/mp2t` 扇出给 DLNA 渲染器（坚果等）做实时屏幕镜像播放。
  *
  * 结构：
@@ -26,17 +28,24 @@ class TsMuxer(
     private val pmtPid: Int = 0x1000,
     private val audioPid: Int? = null,
     private val patPmtIntervalPackets: Int = 40,
+    private val videoCodec: VideoCodec = VideoCodec.H264,
     private val onPacket: (ByteArray) -> Unit,
 ) {
     private val cc = HashMap<Int, Int>()          // continuity counter，按 PID
     private var sps: ByteArray? = null
     private var pps: ByteArray? = null
+    private var vps: ByteArray? = null
     private var packetsSincePatPmt = Int.MAX_VALUE // 强制首帧前先发 PAT/PMT
 
     /** 灌入编码器输出的 SPS/PPS（Annex-B，含 00 00 00 01 起始码）。关键帧前自动重发。 */
     @Synchronized
     fun setSpsPps(sps: ByteArray, pps: ByteArray) {
         this.sps = sps; this.pps = pps
+    }
+
+    @Synchronized
+    fun setVpsSpsPps(vps: ByteArray, sps: ByteArray, pps: ByteArray) {
+        this.vps = vps; this.sps = sps; this.pps = pps
     }
 
     /** 下一个视频帧前强制重发 PAT/SDT/PMT（新观众接入：严格播放器需要流起点就有节目表）。 */
@@ -50,10 +59,12 @@ class TsMuxer(
         maybePatPmt()
         // AUD（访问单元分隔符）每帧前置，对齐 ffmpeg：CoreMedia 的 HLS 子流解析器靠 AUD 界定
         // 样本边界，没有 AUD 时分片里产不出视频样本（VOD 路径宽容，HLS 路径硬性要求，实测）
+        val delimiter = if (videoCodec == VideoCodec.H265) HEVC_AUD else AUD
         val payload = if (keyframe) {
             val s = sps; val p = pps
-            if (s != null && p != null) AUD + s + p + data else AUD + data
-        } else AUD + data
+            val v = if (videoCodec == VideoCodec.H265) vps ?: byteArrayOf() else byteArrayOf()
+            if (s != null && p != null) delimiter + v + s + p + data else delimiter + data
+        } else delimiter + data
         writePes(videoPid, streamId = 0xE0, payload = payload, pts90 = pts90, withPcr = true)
     }
 
@@ -110,7 +121,7 @@ class TsMuxer(
     private fun buildPmtBody(): ByteArray {
         // program_number(2) + flags(1) + section(1) + last(1) + PCR_PID(2) + program_info_length(2) + streams
         val streams = mutableListOf<ByteArray>()
-        streams += streamEntry(0x1B, videoPid)          // H.264
+        streams += streamEntry(videoCodec.streamType(), videoPid)
         audioPid?.let { streams += streamEntry(0x0F, it) } // AAC ADTS
         val bodyLen = 9 + streams.sumOf { it.size }
         val b = ByteArray(bodyLen)
@@ -252,6 +263,7 @@ class TsMuxer(
     companion object {
         /** Access Unit Delimiter（primary_pic_type=0 + rbsp trailing），与 ffmpeg 产出的 AUD 逐字节一致。 */
         private val AUD = byteArrayOf(0, 0, 0, 1, 0x09, 0xF0.toByte())
+        private val HEVC_AUD = byteArrayOf(0, 0, 0, 1, 0x46, 0x01, 0x50)
 
         private fun put16(b: ByteArray, off: Int, v: Int) {
             b[off] = (v ushr 8).toByte(); b[off + 1] = v.toByte()

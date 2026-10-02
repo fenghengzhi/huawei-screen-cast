@@ -13,6 +13,13 @@ public class CastQualityTest {
         assertEquals(new CastQuality(540,20,500), new CastQuality(4320, 240, Integer.MIN_VALUE));
         assertEquals(12000, new CastQuality(720,30,Integer.MAX_VALUE).kbps());
         assertEquals(1300, new CastQuality(720,30,1259).kbps());
-        assertEquals("540p · 20 fps · 1.2 Mbps", CastQuality.DEFAULT.summary());
+        assertEquals("H.264 · 540p · 20 fps · 1.2 Mbps", CastQuality.DEFAULT.summary());
+    }
+    @Test public void codecDefaultsAndSavedIdsRoundTrip() {
+        assertEquals(VideoCodec.H264, new CastQuality(540,20,1200).codec());
+        assertEquals(VideoCodec.H264, VideoCodec.fromId(null));
+        assertEquals(VideoCodec.H264, VideoCodec.fromId("invalid"));
+        for (VideoCodec codec : VideoCodec.values()) assertEquals(codec, VideoCodec.fromId(codec.id()));
+        assertTrue(new CastQuality(720,30,2000,VideoCodec.H265).summary().startsWith("H.265"));
     }
 }

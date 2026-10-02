@@ -7,14 +7,17 @@ package com.airsonic.sender.screen
 import android.hardware.display.DisplayManager
 import android.media.MediaCodec
 import android.media.MediaCodecInfo
+import android.media.MediaCodecList
 import android.media.MediaFormat
 import android.media.projection.MediaProjection
 import android.util.Log
 import com.airsonic.sender.streaming.TsMuxer
+import com.local.huaweicast.VideoCodec
+import com.local.huaweicast.VideoParameterSets
 import kotlin.concurrent.thread
 
 /**
- * 屏幕镜像采集编码器：MediaProjection → VirtualDisplay → MediaCodec(H.264 surface 输入)
+ * 屏幕镜像采集编码器：MediaProjection → VirtualDisplay → MediaCodec(H.264/H.265 surface 输入)
  * → Annex-B → TsMuxer → 188B TS 包经 [onTsPacket] 扇出（交给 HTTP 流服务器）。
  *
  * 编码参数按 DLNA 实时流调优：CBR 恒定码率（压突发防拥塞）、1s GOP、码率可调。
@@ -28,6 +31,7 @@ class ScreenMirrorCaster(
     private val bitRate: Int = 10_000_000,
     private val frameRate: Int = 30,
     private val iFrameIntervalSec: Int = 1,
+    private val videoCodec: VideoCodec = VideoCodec.H264,
     /** true=TS 里加 AAC 音轨（声画同投）；音帧由 [writeAudioFrame] 喂入。 */
     private val withAudio: Boolean = false,
     /** 发一个 TS 包到底层扇出；返回 false=发生了丢弃（拥塞信号）。 */
@@ -73,10 +77,11 @@ class ScreenMirrorCaster(
             droppedInFrame = true; gating = true; requestSyncFrame()
         }
     }
-    private val muxer = TsMuxer(audioPid = if (withAudio) 0x102 else null, onPacket = packetSink)
+    private val muxer = TsMuxer(audioPid = if (withAudio) 0x102 else null, videoCodec = videoCodec, onPacket = packetSink)
+    private val parameterSets = VideoParameterSets(videoCodec)
     @Volatile private var running = false
     private var drainThread: Thread? = null
-    /** 编码器是否已产出 SPS/PPS（未产出前 DLNA Play 无意义）。 */
+    /** 编码器是否已产出所选格式的完整参数集。 */
     @Volatile var ready = false; private set
     /** start 失败原因（vivo 等 ROM 屏蔽 logcat，诊断须透传到 UI 状态行）。 */
     @Volatile var lastError: String? = null; private set
@@ -86,7 +91,14 @@ class ScreenMirrorCaster(
         this.projection = projection
         // Android 14+ 强制：createVirtualDisplay 前必须 registerCallback，否则 SecurityException
         runCatching { projection.registerCallback(projectionCallback, null) }
-        val fmt = MediaFormat.createVideoFormat(MediaFormat.MIMETYPE_VIDEO_AVC, width, height).apply {
+        val encoderInfo = MediaCodecList(MediaCodecList.REGULAR_CODECS).codecInfos.firstOrNull {
+            it.isEncoder && it.isHardwareAccelerated && it.supportedTypes.any { type -> type.equals(videoCodec.mime(), ignoreCase = true) }
+        }
+        if (encoderInfo == null) {
+            lastError = "此手机没有可用的 ${videoCodec.label()} 硬件编码器，请选择其他编码格式"
+            return false
+        }
+        val fmt = MediaFormat.createVideoFormat(videoCodec.mime(), width, height).apply {
             setInteger(MediaFormat.KEY_COLOR_FORMAT,
                 MediaCodecInfo.CodecCapabilities.COLOR_FormatSurface)
             setInteger(MediaFormat.KEY_BIT_RATE, bitRate)
@@ -94,28 +106,32 @@ class ScreenMirrorCaster(
             setInteger(MediaFormat.KEY_I_FRAME_INTERVAL, iFrameIntervalSec)
             setInteger(MediaFormat.KEY_MAX_B_FRAMES, 0)
             setInteger(MediaFormat.KEY_PRIORITY, 0)
-            // Baseline：无 B 帧 → PTS=DTS，PES 打包不用处理重排；兼容性也最好
+            // AVC Baseline / HEVC Main with B frames disabled keeps PTS equal to DTS.
             runCatching {
-                setInteger(MediaFormat.KEY_PROFILE, MediaCodecInfo.CodecProfileLevel.AVCProfileBaseline)
+                setInteger(MediaFormat.KEY_PROFILE, if (videoCodec == VideoCodec.H265) MediaCodecInfo.CodecProfileLevel.HEVCProfileMain else MediaCodecInfo.CodecProfileLevel.AVCProfileBaseline)
             }
             // CBR 恒定码率：压掉码率突发，避免高动态画面瞬间打爆下行队列（冻屏根因之一）
             runCatching {
-                setInteger(MediaFormat.KEY_BITRATE_MODE, MediaCodecInfo.EncoderCapabilities.BITRATE_MODE_CBR)
+                val capabilities = encoderInfo.getCapabilitiesForType(videoCodec.mime()).encoderCapabilities
+                setInteger(MediaFormat.KEY_BITRATE_MODE, if (capabilities?.isBitrateModeSupported(MediaCodecInfo.EncoderCapabilities.BITRATE_MODE_CBR) == true) MediaCodecInfo.EncoderCapabilities.BITRATE_MODE_CBR else MediaCodecInfo.EncoderCapabilities.BITRATE_MODE_VBR)
             }
         }
+        var candidate: MediaCodec? = null
         val c = try {
-            MediaCodec.createEncoderByType(MediaFormat.MIMETYPE_VIDEO_AVC).apply {
+            MediaCodec.createByCodecName(encoderInfo.name).also { candidate = it }.apply {
                 try {
                     configure(fmt, null, null, MediaCodec.CONFIGURE_FLAG_ENCODE)
                 } catch (t: Throwable) {
-                    // 兜底：个别 ROM 编码器拒 Baseline profile，去掉 profile 重配一次
-                    onLog("带 Baseline 配置被拒(${t.message})，去 profile 重试")
+                    // 兜底：个别 ROM 编码器拒绝显式 profile，去掉 profile 重配一次
+                    onLog("${videoCodec.label()} profile 配置被拒(${t.message})，去 profile 重试")
+                    reset()
                     fmt.removeKey(MediaFormat.KEY_PROFILE)
                     configure(fmt, null, null, MediaCodec.CONFIGURE_FLAG_ENCODE)
                 }
             }
         } catch (t: Throwable) {
-            lastError = "编码器初始化: ${t.javaClass.simpleName} ${t.message}"
+            runCatching { candidate?.release() }
+            lastError = "${videoCodec.label()} 编码器初始化: ${t.javaClass.simpleName} ${t.message}"
             onLog("编码器初始化失败: ${t.message}")
             return false
         }
@@ -162,7 +178,7 @@ class ScreenMirrorCaster(
                 }
             }
         }
-        onLog("录屏编码已启动 ${width}x${height}@${frameRate} bitrate=$bitRate")
+        onLog("录屏编码已启动 ${videoCodec.label()} ${encoderInfo.name} ${width}x${height}@${frameRate} bitrate=$bitRate")
         return true
     }
 
@@ -174,8 +190,15 @@ class ScreenMirrorCaster(
                 break
             }
             when {
-                idx == MediaCodec.INFO_OUTPUT_FORMAT_CHANGED ->
-                    onLog("编码器格式: ${c.outputFormat}")
+                idx == MediaCodec.INFO_OUTPUT_FORMAT_CHANGED -> {
+                    val output = c.outputFormat
+                    onLog("编码器格式: $output")
+                    for (key in arrayOf("csd-0", "csd-1", "csd-2")) {
+                        output.getByteBuffer(key)?.duplicate()?.let { buffer ->
+                            val data = ByteArray(buffer.remaining()); buffer.get(data); acceptParameterSets(data)
+                        }
+                    }
+                }
                 idx >= 0 -> {
                     val buf = c.getOutputBuffer(idx)
                     if (buf != null && info.size > 0) {
@@ -195,18 +218,11 @@ class ScreenMirrorCaster(
     }
 
     private fun handleFrame(data: ByteArray, info: MediaCodec.BufferInfo) {
-        if (info.flags and MediaCodec.BUFFER_FLAG_CODEC_CONFIG != 0) {
-            // csd-0：Annex-B 的 SPS+PPS 拼接，拆出来缓存
-            val nals = splitAnnexB(data)
-            if (nals.size >= 2) {
-                muxer.setSpsPps(withStartCode(nals[0]), withStartCode(nals[1]))
-                onCodecConfig?.invoke(nals[0], nals[1])
-                ready = true
-                onLog("SPS/PPS 已缓存 (${nals[0].size}B/${nals[1].size}B)")
-            }
-            return
-        }
-        val keyframe = info.flags and MediaCodec.BUFFER_FLAG_KEY_FRAME != 0
+        val config = info.flags and MediaCodec.BUFFER_FLAG_CODEC_CONFIG != 0
+        val configNals = if (config) VideoParameterSets.splitAnnexB(data) else emptyList()
+        if (config || !ready) acceptParameterSets(data)
+        if (config && configNals.none { videoCodec.isVideoNal(it) }) return
+        val keyframe = info.flags and MediaCodec.BUFFER_FLAG_KEY_FRAME != 0 || configNals.any { videoCodec.isKeyNal(it) }
         if (keyframe) { inKeyframe = true; droppedInFrame = false }
         // pts 归零对齐：视频编码器给的是 nanoTime 系大数，音轨 pts 从 0 起——同基才能声画同步。
         // HLS 模式整体 +1s：对齐 ffmpeg 首 PCR≈0.7s 的惯例（0 起播在 CoreMedia 下有拒产样本风险）。
@@ -271,25 +287,16 @@ class ScreenMirrorCaster(
         onLog("录屏编码已停止")
     }
 
-    /** 把 Annex-B 缓冲拆成裸 NAL（去起始码）。 */
-    private fun splitAnnexB(data: ByteArray): List<ByteArray> {
-        val out = ArrayList<ByteArray>()
-        var i = 0
-        var start = -1
-        while (i + 3 <= data.size) {
-            val is3 = data[i] == 0.toByte() && data[i + 1] == 0.toByte() && data[i + 2] == 1.toByte()
-            val is4 = i + 4 <= data.size && data[i] == 0.toByte() && data[i + 1] == 0.toByte() &&
-                data[i + 2] == 0.toByte() && data[i + 3] == 1.toByte()
-            if (is3 || is4) {
-                if (start >= 0 && start < i) out += data.copyOfRange(start, i)
-                i += if (is4) 4 else 3
-                start = i
-            } else i++
+    private fun acceptParameterSets(data: ByteArray) {
+        parameterSets.accept(data)
+        if (!parameterSets.complete()) return
+        val sps = parameterSets.sps(); val pps = parameterSets.pps()
+        if (videoCodec == VideoCodec.H265) muxer.setVpsSpsPps(parameterSets.vps(), sps, pps)
+        else {
+            muxer.setSpsPps(sps, pps)
+            onCodecConfig?.invoke(sps.copyOfRange(4, sps.size), pps.copyOfRange(4, pps.size))
         }
-        if (start >= 0 && start < data.size) out += data.copyOfRange(start, data.size)
-        return out
+        if (!ready) onLog("${videoCodec.label()} 参数集已就绪")
+        ready = true
     }
-
-    private fun withStartCode(nal: ByteArray): ByteArray =
-        byteArrayOf(0, 0, 0, 1) + nal
 }
