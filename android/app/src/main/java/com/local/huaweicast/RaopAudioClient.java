@@ -28,6 +28,7 @@ public final class RaopAudioClient implements AutoCloseable {
     private static final long MAX_AGE_NS = TimeUnit.MILLISECONDS.toNanos(350);
     private final LegacyMirrorSession session;
     private final int sampleRate, samplesPerFrame;
+    private final VideoCodec videoCodec;
     private final Consumer<String> failure;
     private final SocketFactory sockets;
     private final ArrayBlockingQueue<Frame> frames = new ArrayBlockingQueue<>(32);
@@ -55,7 +56,12 @@ public final class RaopAudioClient implements AutoCloseable {
 
     public RaopAudioClient(LegacyMirrorSession session, int sampleRate, int samplesPerFrame,
                            byte[] audioSpecificConfig, Consumer<String> failure) {
-        this(session, sampleRate, samplesPerFrame, audioSpecificConfig, failure, new SocketFactory() {
+        this(session, sampleRate, samplesPerFrame, audioSpecificConfig, failure, VideoCodec.H264);
+    }
+
+    public RaopAudioClient(LegacyMirrorSession session, int sampleRate, int samplesPerFrame,
+                           byte[] audioSpecificConfig, Consumer<String> failure, VideoCodec videoCodec) {
+        this(session, sampleRate, samplesPerFrame, audioSpecificConfig, failure, videoCodec, new SocketFactory() {
             public Socket tcp() { return new Socket(); }
             public DatagramSocket udp() throws SocketException { return new DatagramSocket(null); }
         });
@@ -63,6 +69,12 @@ public final class RaopAudioClient implements AutoCloseable {
 
     RaopAudioClient(LegacyMirrorSession session, int sampleRate, int samplesPerFrame,
                     byte[] audioSpecificConfig, Consumer<String> failure, SocketFactory sockets) {
+        this(session, sampleRate, samplesPerFrame, audioSpecificConfig, failure, VideoCodec.H264, sockets);
+    }
+
+    RaopAudioClient(LegacyMirrorSession session, int sampleRate, int samplesPerFrame,
+                    byte[] audioSpecificConfig, Consumer<String> failure, VideoCodec videoCodec, SocketFactory sockets) {
+        this.videoCodec = Objects.requireNonNull(videoCodec, "Missing video codec");
         if (sampleRate < 8000 || sampleRate > 96000 || (samplesPerFrame != 480 && samplesPerFrame != 512))
             throw new IllegalArgumentException("Unsupported AAC-ELD audio format");
         AacEldConfig format = AacEldConfig.parse(audioSpecificConfig);
@@ -206,7 +218,8 @@ public final class RaopAudioClient implements AutoCloseable {
                 + "\r\ns=AirTunes\r\nc=IN " + family + " " + address + "\r\nt=0 0\r\n"
                 + "m=audio 0 RTP/AVP 96\r\na=rtpmap:96 mpeg4-generic/" + sampleRate + "/2\r\n"
                 + "a=fmtp:96 mode=AAC-eld; constantDuration=" + samplesPerFrame + "\r\n"
-                + "a=min-latency:" + latencySamples + "\r\nm=video 0 RTP/AVP 97\r\na=rtpmap:97 H264\r\na=fmtp:97\r\n";
+                + "a=min-latency:" + latencySamples + "\r\nm=video 0 RTP/AVP 97\r\na=rtpmap:97 "
+                + (videoCodec == VideoCodec.H265 ? "H265" : "H264") + "\r\na=fmtp:97\r\n";
         return sdp.getBytes(StandardCharsets.US_ASCII);
     }
 

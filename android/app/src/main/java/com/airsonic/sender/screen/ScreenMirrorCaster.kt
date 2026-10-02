@@ -57,6 +57,7 @@ class ScreenMirrorCaster(
     private val onRawVideoFrame: ((data: ByteArray, ptsUs: Long, keyframe: Boolean) -> Unit)? = null,
     private val onRawAudioFrame: ((adtsFrame: ByteArray, ptsUs: Long) -> Unit)? = null,
     private val onCapturedVideoFrame: ((data: ByteArray, monotonicUs: Long, keyframe: Boolean) -> Unit)? = null,
+    private val onHevcCodecConfig: ((vps: ByteArray, sps: ByteArray, pps: ByteArray) -> Unit)? = null,
 ) {
     private val lifecycleLock = Any()
     @Volatile private var codec: MediaCodec? = null
@@ -385,7 +386,11 @@ class ScreenMirrorCaster(
         parameterSets.accept(data)
         if (!parameterSets.complete()) return
         val sps = parameterSets.sps(); val pps = parameterSets.pps()
-        if (videoCodec == VideoCodec.H265) muxer.setVpsSpsPps(parameterSets.vps(), sps, pps)
+        if (videoCodec == VideoCodec.H265) {
+            val vps = parameterSets.vps()
+            muxer.setVpsSpsPps(vps, sps, pps)
+            onHevcCodecConfig?.invoke(vps.copyOfRange(4, vps.size), sps.copyOfRange(4, sps.size), pps.copyOfRange(4, pps.size))
+        }
         else {
             muxer.setSpsPps(sps, pps)
             onCodecConfig?.invoke(sps.copyOfRange(4, sps.size), pps.copyOfRange(4, pps.size))

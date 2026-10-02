@@ -35,6 +35,7 @@ class LegacyMirrorService : Service() {
                 .putExtra("control", endpoint.controlPort()).putExtra("mirror", endpoint.mirrorPort().orElse(0))
                 .putExtra("raop", endpoint.raopPort().orElse(0))
                 .putExtra("height", quality.height()).putExtra("fps", quality.fps()).putExtra("kbps", quality.kbps())
+                .putExtra("codec", quality.codec().id())
     }
 
     private val main = Handler(Looper.getMainLooper())
@@ -103,8 +104,8 @@ class LegacyMirrorService : Service() {
         active = true
         receiverName = intent.getStringExtra("name") ?: ""
         quality = CastQuality(intent.getIntExtra("height", 540), intent.getIntExtra("fps", 20),
-            intent.getIntExtra("kbps", 1200), VideoCodec.H264)
-        details = "H.264 · 仅画面"
+            intent.getIntExtra("kbps", 1200), VideoCodec.fromId(intent.getStringExtra("codec")))
+        details = "${quality.codec().label()} · 仅画面"
         val withAudio = intent.getBooleanExtra("audioEligible", false)
         audioStatus = if (withAudio) "正在连接系统声音" else "仅画面：" +
             (intent.getStringExtra("audioUnavailableReason") ?: "接收端未声明兼容音频能力")
@@ -175,7 +176,7 @@ class LegacyMirrorService : Service() {
                         check(format.sampleRate() == rate && format.channels() == 2) { "音频编码参数不匹配" }
                         if (stopping) return@execute
                         val audio = RaopAudioClient(session, rate, format.samplesPerFrame(), config,
-                            { message -> main.post { finish("音频连接已结束：$message") } })
+                            { message -> main.post { finish("音频连接已结束：$message") } }, quality.codec())
                         audioClient = audio
                         if (stopping) { audio.close(); return@execute }
                         audio.connect(endpoint.address(), endpoint.raopPort().asInt, binder)
@@ -191,14 +192,19 @@ class LegacyMirrorService : Service() {
                         main.post { if (!stopping) { audioStatus = "系统声音 · AAC-ELD"; updateDetails(size) } }
                     }
                     val transport = LegacyMirrorClient(size.width(), size.height(), { caster?.requestSyncFrame() },
-                        { message -> main.post { finish(message) } }, session, latencyMs, audioReady)
+                        { message -> main.post { finish(message) } }, session, latencyMs, audioReady, quality.codec())
                     client = transport
                     if (stopping) { transport.close(); return@execute }
                     transport.connect(mirrorEndpoint, binder)
                     if (stopping) return@execute
                     val encoder = ScreenMirrorCaster(width = size.width(), height = size.height(), dpi = resources.displayMetrics.densityDpi,
-                        bitRate = quality.bitRate(), frameRate = quality.fps(), videoCodec = VideoCodec.H264,
+                        bitRate = quality.bitRate(), frameRate = quality.fps(), videoCodec = quality.codec(),
                         emit = { true }, onCodecConfig = transport::configure,
+                        onHevcCodecConfig = { vps, sps, pps ->
+                            runCatching { transport.configureHevc(vps, sps, pps) }.onFailure { error ->
+                                main.post { finish("H.265 参数集不适合兼容镜像，请切换 H.264：${error.message}") }
+                            }
+                        },
                         onCapturedVideoFrame = { bytes, pts, key ->
                             lastFrameAt = SystemClock.elapsedRealtime()
                             transport.offer(bytes, pts, key)
@@ -239,9 +245,9 @@ class LegacyMirrorService : Service() {
     }
     private fun encodingSize(source: Pair<Int, Int>): MirrorDimensions {
         val info = MediaCodecList(MediaCodecList.REGULAR_CODECS).codecInfos.firstOrNull {
-            it.isEncoder && it.isHardwareAccelerated && it.supportedTypes.any { type -> type.equals(VideoCodec.H264.mime(), true) }
-        } ?: error("此手机没有可用的 H.264 硬件编码器")
-        val limits = info.getCapabilitiesForType(VideoCodec.H264.mime()).videoCapabilities
+            it.isEncoder && it.isHardwareAccelerated && it.supportedTypes.any { type -> type.equals(quality.codec().mime(), true) }
+        } ?: error("此手机没有可用的 ${quality.codec().label()} 硬件编码器")
+        val limits = info.getCapabilitiesForType(quality.codec().mime()).videoCapabilities
             ?: error("无法读取硬件编码尺寸能力")
         val size = MirrorDimensions.fit(source.first, source.second, quality.height(),
             maxOf(2, limits.widthAlignment), maxOf(2, limits.heightAlignment))
@@ -251,7 +257,7 @@ class LegacyMirrorService : Service() {
         return size
     }
     private fun updateDetails(size: MirrorDimensions) {
-        details = "H.264 · ${size.width()}×${size.height()} · ${quality.fps()} fps · " +
+        details = "${quality.codec().label()} · ${size.width()}×${size.height()} · ${quality.fps()} fps · " +
             String.format(Locale.US, "%.1f Mbps", quality.kbps() / 1000.0) + " · $audioStatus"
     }
     private fun scheduleResize() {

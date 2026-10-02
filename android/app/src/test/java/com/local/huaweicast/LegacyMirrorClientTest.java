@@ -19,6 +19,10 @@ public class LegacyMirrorClientTest {
     private static final byte[] SPS = {0x67, 0x42, 0, 0x1e, 0x11};
     private static final byte[] PPS = {0x68, 0x11};
     private static final byte[] FRAME = {0, 0, 0, 1, 0x65, 0x11, 0x22};
+    private static final byte[] HEVC_VPS = {0x40, 1, 12};
+    private static final byte[] HEVC_SPS = {0x42, 1, 34};
+    private static final byte[] HEVC_PPS = {0x44, 1, 56};
+    private static final byte[] HEVC_FRAME = {0, 0, 0, 1, 0x26, 1, 78};
     private static final String CAPABILITIES = "<plist><dict><key>width</key><integer>1920</integer><key>height</key><integer>1080</integer></dict></plist>";
     private static final LegacyMirrorClient.Binder BINDER = new LegacyMirrorClient.Binder() {
         public void bind(Socket socket) {}
@@ -323,6 +327,73 @@ public class LegacyMirrorClientTest {
         }
     }
 
+    @Test public void hevcUsesPcProfileEvenWithoutAudioAndSendsConfigurationBeforeIdr() throws Exception {
+        try (Fixture f = new Fixture(VideoCodec.H265)) {
+            f.client.connect(f.endpoint, BINDER);
+            f.client.configureHevc(HEVC_VPS, HEVC_SPS, HEVC_PPS);
+            f.client.offer(HEVC_FRAME, System.nanoTime() / 1000, true);
+            await(() -> f.client.sentFrames() == 1);
+            byte[] bytes = f.tcp.bytes();
+            int packet = firstPacket(bytes);
+            String handshake = new String(bytes, 0, packet, StandardCharsets.US_ASCII);
+            assertTrue(handshake.contains("User-Agent: AirParrot/1.1 HuaweiCast/1.0"));
+            assertFalse(handshake.contains("bplist00"));
+            ByteBuffer wire = ByteBuffer.wrap(bytes).order(ByteOrder.LITTLE_ENDIAN);
+            assertEquals(1, wire.getShort(packet + 4));
+            byte[] config = LegacyMirrorWire.hevcConfiguration(HEVC_VPS, HEVC_SPS, HEVC_PPS);
+            assertArrayEquals(config, Arrays.copyOfRange(bytes, packet + 128, packet + 128 + wire.getInt(packet)));
+            long pts = wire.getLong(packet + 8);
+            packet += 128 + wire.getInt(packet);
+            assertEquals(0, wire.getShort(packet + 4));
+            assertEquals(pts, wire.getLong(packet + 8));
+            assertArrayEquals(new byte[]{0, 0, 0, 3, 0x46, 1, 0x50, 0, 0, 0, 3, 0x26, 1, 78},
+                    Arrays.copyOfRange(bytes, packet + 128, bytes.length));
+            assertEquals(0, f.failures.get());
+        }
+    }
+
+    @Test public void hevcResizeRequiresNewParameterSetsAndKeyframeOnSameConnection() throws Exception {
+        try (Fixture f = new Fixture(VideoCodec.H265)) {
+            f.client.connect(f.endpoint, BINDER);
+            f.client.configureHevc(HEVC_VPS, HEVC_SPS, HEVC_PPS);
+            f.client.offer(HEVC_FRAME, System.nanoTime() / 1000, true);
+            await(() -> f.client.sentFrames() == 1);
+            int before = f.tcp.bytes().length;
+            f.client.resize(540, 960);
+            f.client.offer(HEVC_FRAME, System.nanoTime() / 1000, true);
+            byte[] changedSps = HEVC_SPS.clone(); changedSps[2] = 35;
+            byte[] expectedConfig = LegacyMirrorWire.hevcConfiguration(HEVC_VPS, changedSps, HEVC_PPS);
+            f.client.configureHevc(HEVC_VPS, changedSps, HEVC_PPS);
+            changedSps[2] = 99;
+            f.client.offer(HEVC_FRAME, System.nanoTime() / 1000, false);
+            Thread.sleep(30);
+            assertEquals(1, f.client.sentFrames());
+            f.client.offer(HEVC_FRAME, System.nanoTime() / 1000, true);
+            await(() -> f.client.sentFrames() == 2);
+            byte[] bytes = f.tcp.bytes();
+            ByteBuffer wire = ByteBuffer.wrap(bytes).order(ByteOrder.LITTLE_ENDIAN);
+            assertEquals(540f, wire.getFloat(before + 40), 0f);
+            assertEquals(960f, wire.getFloat(before + 44), 0f);
+            assertArrayEquals(expectedConfig, Arrays.copyOfRange(bytes, before + 128, before + 128 + wire.getInt(before)));
+            assertEquals(1, f.tcp.connections);
+        }
+    }
+
+    @Test public void hevcRejectsWrongCodecAndOversizedParametersBeforeQueuingMedia() throws Exception {
+        try (Fixture f = new Fixture(VideoCodec.H265)) {
+            assertThrows(IllegalStateException.class, () -> f.client.configure(SPS, PPS));
+            byte[] tooLarge = new byte[128]; tooLarge[0] = 0x40; tooLarge[1] = 1;
+            assertThrows(IllegalArgumentException.class, () -> f.client.configureHevc(tooLarge, HEVC_SPS, HEVC_PPS));
+            f.client.offer(HEVC_FRAME, System.nanoTime() / 1000, true);
+            f.client.connect(f.endpoint, BINDER);
+            Thread.sleep(30);
+            assertEquals(0, f.client.sentFrames());
+        }
+        try (Fixture f = new Fixture()) {
+            assertThrows(IllegalStateException.class, () -> f.client.configureHevc(HEVC_VPS, HEVC_SPS, HEVC_PPS));
+        }
+    }
+
     @Test public void cancellationUnblocksConnectWithoutFalseFailure() throws Exception {
         try (Fixture f = new Fixture()) {
             f.tcp.blockConnect = true;
@@ -406,12 +477,14 @@ public class LegacyMirrorClientTest {
         volatile String message = "";
         final LelinkEndpoint endpoint = LelinkEndpoint.from("receiver", InetAddress.getByAddress(new byte[]{10, 0, 0, 8}), 7100,
                 Map.of("mirror", "7100".getBytes(StandardCharsets.US_ASCII)));
-        final LegacyMirrorClient client = new LegacyMirrorClient(960, 540, keys::incrementAndGet,
-                text -> { message = text; failures.incrementAndGet(); }, new LegacyMirrorClient.SocketFactory() {
+        final LegacyMirrorClient client;
+        Fixture() throws Exception { this(VideoCodec.H264); }
+        Fixture(VideoCodec codec) throws Exception {
+            client = new LegacyMirrorClient(960, 540, keys::incrementAndGet,
+                text -> { message = text; failures.incrementAndGet(); }, null, 90, false, codec, new LegacyMirrorClient.SocketFactory() {
                     public Socket createSocket() { return tcp; }
                     public DatagramSocket createDatagramSocket() { return udp; }
                 });
-        Fixture() throws Exception {
             tcp.reply("HTTP/1.1 200 OK\r\nContent-Length: " + CAPABILITIES.length()
                     + "\r\nConnection: keep-alive\r\n\r\n" + CAPABILITIES);
         }

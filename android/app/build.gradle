@@ -4,7 +4,7 @@ android {
     namespace 'com.local.huaweicast'
     compileSdk 36
     ndkVersion '28.2.13676358'
-    defaultConfig { applicationId 'com.local.huaweicast'; minSdk 29; targetSdk 35; versionCode 10; versionName '1.6.0-beta.3' }
+    defaultConfig { applicationId 'com.local.huaweicast'; minSdk 29; targetSdk 35; versionCode 11; versionName '1.6.0-beta.4' }
     externalNativeBuild { cmake { path file('src/main/cpp/CMakeLists.txt'); version '3.22.1' } }
     compileOptions { coreLibraryDesugaringEnabled true; sourceCompatibility JavaVersion.VERSION_17; targetCompatibility JavaVersion.VERSION_17 }
     if (releaseKeystore != null) {

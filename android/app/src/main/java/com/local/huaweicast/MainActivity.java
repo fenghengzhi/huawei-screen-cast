@@ -229,21 +229,23 @@ public final class MainActivity extends Activity {
             return;
         }
         // /stream.xml can open the receiver's player. Only contact it after projection consent.
-        CastQuality compatibleQuality = new CastQuality(quality.height(), quality.fps(), quality.kbps(), VideoCodec.H264);
+        CastQuality compatibleQuality = quality;
         RaopCapabilities audio = audioCapabilities(endpoint);
         boolean audioEligible = audio != null && audio.eligible();
         String audioNote = audioEligible ? "默认尝试采集并传送系统播放声音，不录制麦克风；音频连接失败时会明确提示并停止。"
                 : "本次仅画面：" + audioUnavailableReason(endpoint, audio) + "。";
         SharedPreferences preferences = getSharedPreferences("cast", MODE_PRIVATE);
-        if (audioEligible && preferences.getBoolean("leboCompatibilityAudioNotice", false)) {
+        if (audioEligible && preferences.getBoolean("leboCompatibilityCodecNotice", false)) {
             requestCompatibleMirror(endpoint, compatibleQuality);
             return;
         }
         showCompatibilityDialog(new AlertDialog.Builder(this).setTitle("乐播兼容镜像").setMessage(
-            "通过接收端的 AirPlay 兼容接口传送 H.264 画面。" + audioNote + "这不是完整 Lelink 协议，不绕过接收端的收费、授权或时长限制。音视频在局域网明文传输。\n\n本次画质："
-            + compatibleQuality.summary() + "\n使用已保存的画质参数；DLNA 编码选择保持不变。")
+            "通过接收端的 AirPlay 兼容接口传送 " + compatibleQuality.codec().label() + " 画面。" + audioNote
+            + "H.265 需要接收端支持此兼容格式；黑屏时请结束投屏并在画质设置切回 H.264。"
+            + "这不是完整 Lelink 协议，不绕过接收端的收费、授权或时长限制。音视频在局域网明文传输。\n\n本次画质："
+            + compatibleQuality.summary() + "\n使用已保存的分辨率、帧率、码率和编码格式。")
             .setNegativeButton("取消", null).setPositiveButton("开始投屏", (d,w) -> {
-                preferences.edit().putBoolean("leboCompatibilityAudioNotice", true).apply();
+                preferences.edit().putBoolean("leboCompatibilityCodecNotice", true).apply();
                 requestCompatibleMirror(endpoint, compatibleQuality);
             }).create());
     }

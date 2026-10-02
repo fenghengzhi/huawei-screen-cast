@@ -21,7 +21,7 @@ public final class LegacyMirrorClient implements AutoCloseable {
         Socket createSocket() throws IOException;
         DatagramSocket createDatagramSocket() throws IOException;
     }
-    private record CodecConfig(int width, int height, byte[] sps, byte[] pps, long generation) {}
+    private record CodecConfig(int width, int height, byte[] vps, byte[] sps, byte[] pps, long generation) {}
     private record Frame(byte[] data, long pts, boolean key, long queuedNs, CodecConfig config) {}
     private static final long MAX_QUEUE_AGE_NS = TimeUnit.MILLISECONDS.toNanos(500);
     private final ArrayBlockingQueue<Frame> frames = new ArrayBlockingQueue<>(8);
@@ -33,7 +33,8 @@ public final class LegacyMirrorClient implements AutoCloseable {
     private final SocketFactory socketFactory;
     private final LegacyMirrorSession sharedSession;
     private final int latencyMs;
-    private final boolean companionAudio;
+    private final boolean pcCompatibilityProfile;
+    private final VideoCodec videoCodec;
     private final AtomicBoolean closed = new AtomicBoolean(), connectionStarted = new AtomicBoolean();
     private boolean waitingKey = true;
     private CodecConfig configuration;
@@ -52,7 +53,11 @@ public final class LegacyMirrorClient implements AutoCloseable {
     }
     public LegacyMirrorClient(int width, int height, Runnable requestKey, Consumer<String> failure,
                               LegacyMirrorSession session, int latencyMs, boolean companionAudio) {
-        this(width, height, requestKey, failure, session, latencyMs, companionAudio, new SocketFactory() {
+        this(width, height, requestKey, failure, session, latencyMs, companionAudio, VideoCodec.H264);
+    }
+    public LegacyMirrorClient(int width, int height, Runnable requestKey, Consumer<String> failure,
+                              LegacyMirrorSession session, int latencyMs, boolean companionAudio, VideoCodec videoCodec) {
+        this(width, height, requestKey, failure, session, latencyMs, companionAudio, videoCodec, new SocketFactory() {
             @Override public Socket createSocket() { return new Socket(); }
             @Override public DatagramSocket createDatagramSocket() throws SocketException { return new DatagramSocket(null); }
         });
@@ -66,19 +71,33 @@ public final class LegacyMirrorClient implements AutoCloseable {
     }
     LegacyMirrorClient(int width, int height, Runnable requestKey, Consumer<String> failure,
                       LegacyMirrorSession session, int latencyMs, boolean companionAudio, SocketFactory socketFactory) {
+        this(width, height, requestKey, failure, session, latencyMs, companionAudio, VideoCodec.H264, socketFactory);
+    }
+    LegacyMirrorClient(int width, int height, Runnable requestKey, Consumer<String> failure,
+                      LegacyMirrorSession session, int latencyMs, boolean companionAudio, VideoCodec videoCodec, SocketFactory socketFactory) {
         validateDimensions(width, height);
         if (latencyMs < 0 || latencyMs > 5000) throw new IllegalArgumentException("Invalid mirror latency");
         if (companionAudio && session == null) throw new IllegalArgumentException("Missing shared audio session");
         this.width = width; this.height = height; this.requestKey = requestKey; this.failure = failure;
         this.socketFactory = socketFactory;
         this.sharedSession = session; this.latencyMs = latencyMs;
-        this.companionAudio = companionAudio;
+        this.videoCodec = java.util.Objects.requireNonNull(videoCodec);
+        this.pcCompatibilityProfile = companionAudio || videoCodec == VideoCodec.H265;
     }
     public long sentFrames() { return sentFrames; }
     public long timingReplies() { return timingReplies; }
     public void configure(byte[] sps, byte[] pps) {
+        if (videoCodec != VideoCodec.H264) throw new IllegalStateException("Expected HEVC parameter sets");
         synchronized (frameLock) {
-            if (!closed.get()) configuration = new CodecConfig(width, height, sps.clone(), pps.clone(), formatGeneration);
+            if (!closed.get()) configuration = new CodecConfig(width, height, null, sps.clone(), pps.clone(), formatGeneration);
+        }
+    }
+    public void configureHevc(byte[] vps, byte[] sps, byte[] pps) {
+        if (videoCodec != VideoCodec.H265) throw new IllegalStateException("Expected AVC parameter sets");
+        // Validate the receiver's bounded legacy configuration before storing anything for the writer.
+        LegacyMirrorWire.hevcConfiguration(vps, sps, pps);
+        synchronized (frameLock) {
+            if (!closed.get()) configuration = new CodecConfig(width, height, vps.clone(), sps.clone(), pps.clone(), formatGeneration);
         }
     }
     /** Call after stopping the old encoder and before starting its replacement. The connection and clock stay intact. */
@@ -133,11 +152,11 @@ public final class LegacyMirrorClient implements AutoCloseable {
         tcp.setTcpNoDelay(true); tcp.setSoTimeout(1000);
         long id = session.deviceId();
         // In the PC compatibility profile GET establishes the session; G2's POST parser does not consume a body.
-        byte[] info = companionAudio ? new byte[0] : LegacyMirrorWire.streamInfo(id, session.sessionId(), latencyMs);
+        byte[] info = pcCompatibilityProfile ? new byte[0] : LegacyMirrorWire.streamInfo(id, session.sessionId(), latencyMs);
         String host = endpoint.address().getHostAddress();
         if (host.contains(":")) host = "[" + host + "]";
         // This compatibility profile is explicitly plaintext; our own product name remains in the UA.
-        String userAgent = companionAudio ? "AirParrot/1.1 HuaweiCast/1.0" : "HuaweiCast-Experimental/1.0";
+        String userAgent = pcCompatibilityProfile ? "AirParrot/1.1 HuaweiCast/1.0" : "HuaweiCast-Experimental/1.0";
         String header = "POST /stream HTTP/1.1\r\nHost: " + host + ":" + endpoint.mirrorPort().getAsInt()
             + "\r\nUser-Agent: " + userAgent + "\r\nX-Apple-Device-ID: 0x" + Long.toHexString(id)
             + (info.length == 0 ? "" : "\r\nContent-Type: application/x-apple-binary-plist")
@@ -163,7 +182,7 @@ public final class LegacyMirrorClient implements AutoCloseable {
         request.write(header.getBytes(StandardCharsets.US_ASCII)); request.write(info);
         out.write(request.toByteArray()); out.flush();
         // This legacy receiver discards bytes coalesced with POST, including an immediately following frame.
-        if (companionAudio) TimeUnit.MILLISECONDS.sleep(100);
+        if (pcCompatibilityProfile) TimeUnit.MILLISECONDS.sleep(100);
         if (closed.get()) throw new IOException("兼容镜像已取消");
         start("legacy-mirror-timing", () -> timingLoop(udp, endpoint.address()));
         start("legacy-mirror-response", () -> responseLoop(tcp));
@@ -176,8 +195,13 @@ public final class LegacyMirrorClient implements AutoCloseable {
                     if (config.generation() != formatGeneration) continue;
                     if (System.nanoTime() - frame.queuedNs() > MAX_QUEUE_AGE_NS) { recoverQueue(config.generation()); continue; }
                     long pts = Math.max(0, frame.pts() - epochNs / 1000);
-                    if (frame.key()) out.write(LegacyMirrorWire.codecPacket(config.sps(), config.pps(), config.width(), config.height(), pts));
-                    out.write(LegacyMirrorWire.videoPacket(frame.data(), config.width(), config.height(), pts));
+                    if (videoCodec == VideoCodec.H265) {
+                        if (frame.key()) out.write(LegacyMirrorWire.hevcCodecPacket(config.vps(), config.sps(), config.pps(), config.width(), config.height(), pts));
+                        out.write(LegacyMirrorWire.hevcVideoPacket(frame.data(), config.width(), config.height(), pts));
+                    } else {
+                        if (frame.key()) out.write(LegacyMirrorWire.codecPacket(config.sps(), config.pps(), config.width(), config.height(), pts));
+                        out.write(LegacyMirrorWire.videoPacket(frame.data(), config.width(), config.height(), pts));
+                    }
                 }
                 out.flush(); lastWriteNs = System.nanoTime();
                 if (frame != null) sentFrames++;

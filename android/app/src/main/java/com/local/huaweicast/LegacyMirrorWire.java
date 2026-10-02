@@ -9,7 +9,7 @@ import java.nio.ByteOrder;
 import java.util.Arrays;
 import java.util.List;
 
-/** Independent encoding of the publicly documented legacy AirPlay mirror wire format. */
+/** Independent legacy AirPlay framing with narrowly scoped receiver compatibility packets. */
 public final class LegacyMirrorWire {
     public static final int HEADER_SIZE = 128;
     private static final int MAX_PAYLOAD_SIZE = 16 * 1024 * 1024;
@@ -36,6 +36,34 @@ public final class LegacyMirrorWire {
 
     public static byte[] videoPacket(byte[] annexB, int width, int height, long timestampUs) {
         return packet(0, annexBToAvcc(annexB), width, height, timestampUs);
+    }
+
+    /** G2's legacy PC path passes these NAL arrays to its HEVC-aware decoder; this is not hvcC. */
+    public static byte[] hevcCodecPacket(byte[] vps, byte[] sps, byte[] pps, int width, int height, long timestampUs) {
+        return packet(1, hevcConfiguration(vps, sps, pps), width, height, timestampUs);
+    }
+
+    public static byte[] hevcConfiguration(byte[] vps, byte[] sps, byte[] pps) {
+        byte[] video = singleHevcNal(vps, 32);
+        byte[] sequence = singleHevcNal(sps, 33);
+        byte[] picture = singleHevcNal(pps, 34);
+        int nalBytes = video.length + sequence.length + picture.length;
+        // G2 expands the three NALs with four-byte start codes into a fixed 128-byte buffer.
+        if (nalBytes + 12 > 128) throw new IllegalArgumentException("H.265 parameter sets exceed receiver's 128-byte buffer");
+        return ByteBuffer.allocate(nalBytes + 13).put(new byte[]{1, 0, 0, 0, (byte) 0xff, (byte) 0xe2})
+                .putShort((short) video.length).put(video).putShort((short) sequence.length).put(sequence)
+                .put((byte) 1).putShort((short) picture.length).put(picture).array();
+    }
+
+    public static byte[] hevcVideoPacket(byte[] annexB, int width, int height, long timestampUs) {
+        if (annexB == null || annexB.length == 0 || annexB.length > MAX_PAYLOAD_SIZE || !hasStartCode(annexB)) {
+            throw new IllegalArgumentException("Expected an Annex-B H.265 access unit");
+        }
+        List<byte[]> nals = strictAnnexB(annexB);
+        if (nals.isEmpty()) throw new IllegalArgumentException("Empty H.265 access unit");
+        for (byte[] nal : nals) validateHevcNal(nal);
+        boolean needsAud = ((nals.get(0)[0] & 0x7e) >>> 1) != 35;
+        return packet(0, hevcLengthPrefixed(nals, needsAud), width, height, timestampUs);
     }
 
     public static byte[] heartbeatPacket() {
@@ -147,6 +175,35 @@ public final class LegacyMirrorWire {
         return nal;
     }
 
+    private static byte[] singleHevcNal(byte[] data, int expectedType) {
+        if (data == null || data.length == 0 || data.length > 65539) {
+            throw new IllegalArgumentException("Missing H.265 parameter set");
+        }
+        byte[] nal;
+        if (hasStartCode(data)) {
+            List<byte[]> nals = strictAnnexB(data);
+            if (nals.size() != 1) throw new IllegalArgumentException("Expected one H.265 parameter set");
+            nal = nals.get(0);
+        } else nal = Arrays.copyOf(data, data.length);
+        validateHevcNal(nal);
+        if (nal.length > 65535 || ((nal[0] & 0x7e) >>> 1) != expectedType) {
+            throw new IllegalArgumentException("Invalid H.265 parameter set length or type");
+        }
+        return nal;
+    }
+
+    private static byte[] hevcLengthPrefixed(List<byte[]> nals, boolean prependAud) {
+        long length = prependAud ? 7 : 0;
+        for (byte[] nal : nals) length += 4L + nal.length;
+        if (length > MAX_PAYLOAD_SIZE) throw new IllegalArgumentException("H.265 access unit too large");
+        ByteBuffer payload = ByteBuffer.allocate((int) length);
+        // This receiver removes the first NAL if its low five bits look like AVC SEI.
+        // A standard HEVC AUD lets that one removal leave IDR/TSA picture NALs intact.
+        if (prependAud) payload.putInt(3).put(new byte[]{0x46, 0x01, 0x50});
+        for (byte[] nal : nals) payload.putInt(nal.length).put(nal);
+        return payload.array();
+    }
+
     private static boolean hasStartCode(byte[] data) {
         return data.length >= 3 && data[0] == 0 && data[1] == 0
                 && (data[2] == 1 || (data.length >= 4 && data[2] == 0 && data[3] == 1));
@@ -172,6 +229,12 @@ public final class LegacyMirrorWire {
     private static void validateNal(byte[] nal) {
         if (nal.length == 0 || (nal[0] & 0x80) != 0 || (nal[0] & 31) == 0 || (nal[0] & 31) > 23) {
             throw new IllegalArgumentException("Invalid H.264 NAL unit");
+        }
+    }
+
+    private static void validateHevcNal(byte[] nal) {
+        if (nal.length < 2 || (nal[0] & 0x80) != 0 || (nal[1] & 7) == 0) {
+            throw new IllegalArgumentException("Invalid H.265 NAL unit");
         }
     }
 }

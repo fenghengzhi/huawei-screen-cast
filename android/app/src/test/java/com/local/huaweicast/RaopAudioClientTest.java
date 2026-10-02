@@ -29,6 +29,8 @@ public class RaopAudioClientTest {
             assertTrue(announce.contains("User-Agent: AirParrot/1.1 HuaweiCast/1.0"));
             assertTrue(announce.contains("mpeg4-generic/44100/2"));
             assertTrue(announce.contains("mode=AAC-eld; constantDuration=512\r\n"));
+            assertTrue(announce.contains("a=rtpmap:97 H264\r\n"));
+            assertFalse(announce.contains("a=rtpmap:97 H265"));
             assertFalse(announce.contains("config="));
             assertFalse(announce.contains("fpaeskey"));
             assertFalse(announce.contains("aesiv"));
@@ -44,6 +46,28 @@ public class RaopAudioClientTest {
             assertEquals(200, f.client.latencyMs());
             assertEquals(0, f.failures.get());
         }
+    }
+
+    @Test public void h265IsAnnouncedWithoutChangingAudioOrSessionProtocolHeaders() throws Exception {
+        try (Fixture f = new Fixture(VideoCodec.H265)) {
+            f.connect();
+            String announce = f.tcp.requests.get(0);
+            assertTrue(announce.contains("m=video 0 RTP/AVP 97\r\na=rtpmap:97 H265\r\n"));
+            assertFalse(announce.contains("a=rtpmap:97 H264"));
+            assertTrue(announce.contains("mpeg4-generic/44100/2"));
+            assertTrue(announce.contains("mode=AAC-eld; constantDuration=512\r\n"));
+            assertTrue(announce.contains("X-LeLink-Device-ID: 0x" + Long.toHexString(f.session.deviceId())));
+            assertFalse(announce.contains("X-Apple-Device-ID:"));
+            assertTrue(announce.contains("User-Agent: AirParrot/1.1 HuaweiCast/1.0"));
+            assertTrue(f.tcp.requests.get(1).contains("Audio-Type: sample_rate=44100;channels=2\r\n"));
+            assertTrue(f.tcp.requests.get(2).contains("Session: DEADBEEF\r\n"));
+            assertEquals(4, f.tcp.requests.size());
+        }
+    }
+
+    @Test public void explicitVideoCodecCannotBeNull() {
+        try { new RaopAudioClient(LegacyMirrorSession.create(), 44100, 512, CONFIG, ignored -> {}, (VideoCodec) null); fail(); }
+        catch (NullPointerException expected) { assertTrue(expected.getMessage().contains("video codec")); }
     }
 
     @Test public void audioSetupAdvertisesActualSampleRateWithoutHardcoding44100() {
@@ -393,10 +417,16 @@ public class RaopAudioClientTest {
         volatile String message;
         Fixture() { this(44100, 512, CONFIG); }
         Fixture(int sampleRate, int samplesPerFrame, byte[] config) {
-            client = new RaopAudioClient(session, sampleRate, samplesPerFrame, config, value -> { message = value; failures.incrementAndGet(); }, new RaopAudioClient.SocketFactory() {
+            client = new RaopAudioClient(session, sampleRate, samplesPerFrame, config, value -> { message = value; failures.incrementAndGet(); }, socketFactory());
+        }
+        Fixture(VideoCodec videoCodec) {
+            client = new RaopAudioClient(session, 44100, 512, CONFIG, value -> { message = value; failures.incrementAndGet(); }, videoCodec, socketFactory());
+        }
+        private RaopAudioClient.SocketFactory socketFactory() {
+            return new RaopAudioClient.SocketFactory() {
                 public Socket tcp() { return tcp; }
                 public DatagramSocket udp() throws IOException { FakeUdp value = new FakeUdp(); udps.add(value); return value; }
-            });
+            };
         }
         void connect() throws IOException { client.connect(PEER, 52244, new LegacyMirrorClient.Binder() {
             public void bind(Socket socket) { bindings.incrementAndGet(); }

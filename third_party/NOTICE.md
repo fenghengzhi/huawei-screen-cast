@@ -6,7 +6,7 @@ Local changes to ScreenMirrorCaster: feed its input through a fixed-rate EGL ren
 
 Required Notice: Copyright (c) 2026 Chunguang Wei (https://github.com/chunguangwei).
 
-ScreenMirrorCaster also accepts captured AAC with a shared monotonic video timestamp origin and serializes audio/video writes across HLS segment boundaries. It exposes captured video callbacks and can replace its encoder and input surface while resizing the same virtual display, with bounded worker shutdown for orientation changes.
+ScreenMirrorCaster also accepts captured AAC with a shared monotonic video timestamp origin and serializes audio/video writes across HLS segment boundaries. It exposes captured video callbacks, including separate raw HEVC VPS/SPS/PPS callbacks, and can replace its encoder and input surface while resizing the same virtual display, with bounded worker shutdown for orientation changes.
 
 These files are licensed under the PolyForm Noncommercial License 1.0.0. See `AirSonic-LICENSE` for the complete license. Personal, noncommercial use is permitted; commercial use requires the author's written consent. This app is being built for personal use, without the Lebo SDK or its subscription services.
 
