@@ -77,7 +77,7 @@ ANDROID_HOME=/path/to/Android/sdk ./gradlew :app:assembleDebug :app:testDebugUni
 
 输出 `android/app/build/outputs/apk/debug/app-debug.apk`。支持 Android 10+、EMUI 和兼容安卓应用的 HarmonyOS，不支持 HarmonyOS NEXT 原生应用。
 
-GitHub Actions 会在主分支和 Pull Request 自动运行构建、测试与 Lint。推送匹配应用版本的 `v*` 标签后，自动构建带固定发布签名的 APK 并上传到 GitHub Releases，附带 SHA-256 校验文件和第三方许可声明。签名密钥保存在仓库 Secrets 中，不进入源代码。具体流程见 [发布说明](docs/releasing.md)。
+GitHub Actions 会在推送 `main`、`codex/lelink-experiment` 或向 `main` 提交 Pull Request 时自动运行构建、测试与 Lint，并上传调试 APK 供下载。普通分支推送不发布 Release；推送匹配应用版本的 `v*` 标签后，自动构建带固定发布签名的 APK 并上传到 GitHub Releases，附带 SHA-256 校验文件和第三方许可声明。签名密钥保存在仓库 Secrets 中，不进入源代码。具体流程见 [发布说明](docs/releasing.md)。
 
 首次从本地调试版切换到 Release 版时，由于签名证书不同，需要卸载调试版再安装，原画质设置会被清除。之后的 Release 版本可直接覆盖更新。
 

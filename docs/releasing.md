@@ -1,6 +1,6 @@
 # GitHub Actions 发布
 
-主分支提交和 Pull Request 会自动编译调试 APK、执行单元测试及 Android Lint。版本标签 `v*` 在上述检查通过后构建签名 Release APK，并发布到 GitHub Releases。
+推送 `main`、`codex/lelink-experiment` 或向 `main` 提交 Pull Request 会自动编译调试 APK、执行单元测试及 Android Lint，并上传调试 APK 与检查报告。普通分支推送不发布 Release；版本标签 `v*` 在上述检查通过后构建签名 Release APK，并发布到 GitHub Releases。
 
 ## 签名配置
 
