@@ -56,6 +56,7 @@ class ScreenMirrorCaster(
     private val onCodecConfig: ((sps: ByteArray, pps: ByteArray) -> Unit)? = null,
     private val onRawVideoFrame: ((data: ByteArray, ptsUs: Long, keyframe: Boolean) -> Unit)? = null,
     private val onRawAudioFrame: ((adtsFrame: ByteArray, ptsUs: Long) -> Unit)? = null,
+    private val onCapturedVideoFrame: ((data: ByteArray, monotonicUs: Long, keyframe: Boolean) -> Unit)? = null,
 ) {
     @Volatile private var codec: MediaCodec? = null
     private var display: android.hardware.display.VirtualDisplay? = null
@@ -235,6 +236,7 @@ class ScreenMirrorCaster(
         }
         muxer.writeVideoFrame(data, relPts, keyframe)
         onRawVideoFrame?.invoke(data, relPts, keyframe)   // fMP4 旁路：原始帧（无 AUD）
+        onCapturedVideoFrame?.invoke(data, info.presentationTimeUs, keyframe)
         if (keyframe) {
             inKeyframe = false
             if (!droppedInFrame) gating = false   // 本关键帧完整发出 → 拥塞恢复完成

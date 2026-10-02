@@ -18,5 +18,6 @@
         </activity>
         <service android:name=".MediaService" android:foregroundServiceType="dataSync" android:exported="false" />
         <service android:name=".MirrorService" android:foregroundServiceType="mediaProjection" android:exported="false" />
+        <service android:name=".LegacyMirrorService" android:foregroundServiceType="mediaProjection" android:exported="false" />
     </application>
 </manifest>

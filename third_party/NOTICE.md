@@ -11,3 +11,5 @@ ScreenMirrorCaster also accepts captured AAC with a shared monotonic video times
 These files are licensed under the PolyForm Noncommercial License 1.0.0. See `AirSonic-LICENSE` for the complete license. Personal, noncommercial use is permitted; commercial use requires the author's written consent. This app is being built for personal use, without the Lebo SDK or its subscription services.
 
 The local HTTP servers use [NanoHTTPD](https://github.com/NanoHttpd/nanohttpd), version 2.3.1, under its BSD license.
+
+The experimental legacy AirPlay handshake uses [dd-plist](https://github.com/3breadt/dd-plist), version 1.30, under its MIT license; see `dd-plist-LICENSE`. Discovery fields and legacy wire formats were independently implemented from public protocol descriptions, not copied from the proprietary Lebo SDK.

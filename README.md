@@ -24,7 +24,21 @@
 
 可以单独分享照片、视频和音乐：选择设备后点击“选择媒体并投屏”。通过系统文件选择器读取所选文件，缓存到应用私有目录，通过随机 URL 的本地 HTTP 服务提供给电视。支持 GET、HEAD、HTTP Range、暂停、继续及结束。单个文件最大 2 GB，不转码；媒体兼容性由机顶盒决定。结束时关闭服务器、清除缓存并释放 Wi-Fi 锁。
 
-应用的 mDNS 发现只用于协议诊断。乐联或 AirPlay 设备若没有 DLNA 服务，会标明未接入相应协议。SSDP 使用实际 Wi-Fi 网络绑定，避免 VPN 或蜂窝网络误选接口。
+应用的 mDNS 发现默认只用于协议诊断。乐联设备另有下文所述的独立实验入口，不会自动替代 DLNA。SSDP 使用实际 Wi-Fi 网络绑定，避免 VPN 或蜂窝网络误选接口。
+
+## 乐联兼容性实验
+
+当前实验分支不等于完整的 Lelink 私有协议实现，也没有引入乐播 SDK。设备列表的“乐联协议实验”入口会解析 `_leboremote._tcp` 广播，通过控制端口的 RTSP OPTIONS 和广播镜像端口的 `/stream.xml` 做只读检测。广播名称、UID 或端口存在均不被当成投屏成功。
+
+部分乐播接收端同时提供旧版 AirPlay 兼容镜像入口。能力检测通过后，可明确选择“测试 30 秒”：经系统录屏授权，尝试发送 H.264 540p / 20 fps 画面，在同一 TCP 连接上先 GET `/stream.xml` 再 POST `/stream`，使用二进制 plist 握手、128 字节包头、avcC 参数集、AVCC 视频帧、心跳与 NTP 应答。该实验仅画面、无声音、无加密，30 秒自动结束；仅用于可信局域网，不应投送敏感内容。正常 DLNA 模式仍默认包含系统声音。
+
+实验遇到授权拒绝或不支持的响应会停止，不提交乐播凭据、不绕过会员或认证。发送帧数只代表写入连接，不证明电视已显示画面；实际兼容性需要接收端确认。尚未实现私有 Lelink 会话协商、声音传输和加密协商，不对外发布为正式 Lelink 支持。
+
+2026-10-02：电信机顶盒的 RTSP OPTIONS 和 `/stream.xml` 均返回 200，但未确认其实际画面。后续按用户指定改用“投屏电视G2”（接收端 8.20.56），已通过接收端截图确认显示华为手机画面，硬件解码日志连续约 20 fps。直接 POST 不触发播放；同连接 GET→POST 加保留零值的帧头扩展字段可正常显示。填写偏移 56/60 的输出尺寸反而使 G2 无法解码，故本实验保留这些未协商字段为零。接收端没有请求 NTP，不能据此认定 NTP 互操作已通过。能力查询在 G2 上可能短暂进入镜像界面，并非保证完全无界面副作用。
+
+**G2 明确显示“限时体验 5 分钟，开通会员享不限时投屏”。该实验不能免除接收端的收费或限时策略，不提供自动重连重置试用时间等绕过功能。** 当前测试仍有较大黑边，声音、缩放、长期稳定性和其他接收端兼容性尚待完善，实验分支不触发正式 Release。
+
+公开协议事实来源：[乐播发现字段](https://github.com/lebosdk/Lebo-mDNS-Client)、[旧版镜像握手](https://github.com/openairplay/airplay-spec/blob/master/src/screen_mirroring/http_requests.md)、[封包](https://github.com/openairplay/airplay-spec/blob/master/src/screen_mirroring/stream_packets.md)、[时钟同步](https://github.com/openairplay/airplay-spec/blob/master/src/screen_mirroring/time_synchronization.md)。未复制这些项目的代码。
 
 ## 构建与测试
 
