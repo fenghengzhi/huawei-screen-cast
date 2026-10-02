@@ -66,7 +66,7 @@ public final class MainActivity extends Activity {
         modes.setOnCheckedChangeListener((g,id) -> mirrorMode = id == compatible.getId() ? "hls" : "ts"); add(root, modes, 16);
         qualityButton = button("画质设置\n" + quality.summary(), false); qualityButton.setOnClickListener(v -> editQuality()); add(root, qualityButton, 4);
         mirrorButton = button("开始屏幕投屏", true); mirrorButton.setEnabled(false); add(root, mirrorButton, 8); mirrorButton.setOnClickListener(v -> startMirror());
-        TextView mirrorNote = text("画质设置于下次投屏生效 · 不包含系统音频", 10, MUTED, false); mirrorNote.setGravity(Gravity.CENTER); add(root, mirrorNote, 10);
+        TextView mirrorNote = text("系统声音已开启 · 不录制麦克风", 10, MUTED, false); mirrorNote.setGravity(Gravity.CENTER); add(root, mirrorNote, 10);
         chooseButton = button("选择媒体并投屏", false); chooseButton.setEnabled(false); add(root, chooseButton, 16); chooseButton.setOnClickListener(v -> chooseMedia());
         mediaStatus = text("", 12, MUTED, false); add(root, mediaStatus, 12);
         LinearLayout controls = new LinearLayout(this); controls.setGravity(Gravity.CENTER);
@@ -172,9 +172,20 @@ public final class MainActivity extends Activity {
     }
     private void startMirror() {
         if (selected == null || MirrorService.active || MediaService.state.active()) return;
+        if (checkSelfPermission(Manifest.permission.RECORD_AUDIO) != android.content.pm.PackageManager.PERMISSION_GRANTED) {
+            requestPermissions(new String[]{Manifest.permission.RECORD_AUDIO}, 21);
+            return;
+        }
         permissionTarget = selected;
         mirrorButton.setEnabled(false);
         startActivityForResult(getSystemService(android.media.projection.MediaProjectionManager.class).createScreenCaptureIntent(), 11);
+    }
+    @Override public void onRequestPermissionsResult(int request, String[] permissions, int[] results) {
+        super.onRequestPermissionsResult(request, permissions, results);
+        if (request == 21) {
+            if (results.length > 0 && results[0] == android.content.pm.PackageManager.PERMISSION_GRANTED) startMirror();
+            else Toast.makeText(this, "投屏需要录音权限以采集系统声音，请在应用权限设置中允许。不会录制麦克风。", Toast.LENGTH_LONG).show();
+        }
     }
     @Override protected void onActivityResult(int request, int result, Intent data) {
         super.onActivityResult(request, result, data);

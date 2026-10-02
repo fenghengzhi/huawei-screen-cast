@@ -40,7 +40,7 @@ public final class MirrorService extends Service {
             projection.registerCallback(projectionCallback, handler);
             WifiManager wifi = (WifiManager) getApplicationContext().getSystemService(WIFI_SERVICE);
             wifiLock = wifi.createWifiLock(WifiManager.WIFI_MODE_FULL_HIGH_PERF, "HuaweiCast:mirror"); wifiLock.acquire();
-            engine = new MirrorEngine();
+            engine = new MirrorEngine(message -> { handler.post(() -> finish(message)); return kotlin.Unit.INSTANCE; });
             CastQuality quality = new CastQuality(intent.getIntExtra("height", 540), intent.getIntExtra("fps", 20), intent.getIntExtra("kbps", 1200), VideoCodec.fromId(intent.getStringExtra("codec")));
             android.util.Log.i("HuaweiCastMirror", "quality=" + quality.summary());
             if (!engine.start(projection, getResources().getDisplayMetrics().densityDpi, quality)) throw new IllegalStateException(engine.error());
@@ -76,7 +76,7 @@ public final class MirrorService extends Service {
                 long now = System.currentTimeMillis();
                 String transport = "";
                 try { transport = Dlna.invoke(device, "GetTransportInfo", Map.of()).getOrDefault("CurrentTransportState", ""); } catch (Exception ignored) {}
-                if (last > 0 && now - last < 10000) publish(("PLAYING".equals(transport) ? "机顶盒正在播放" : "机顶盒正在接收") + " · " + (now-startedAt)/1000 + " 秒 · " + server.bytes()/1048576 + " MB · 仅画面");
+                if (last > 0 && now - last < 10000) publish(("PLAYING".equals(transport) ? "机顶盒正在播放" : "机顶盒正在接收") + " · " + (now-startedAt)/1000 + " 秒 · " + server.bytes()/1048576 + " MB · 系统声音");
                 else if (now - Math.max(last, startedAt) > 45000) handler.post(() -> finish("机顶盒未持续取流。可切换直播兼容模式再试。"));
             }, 1, 2, TimeUnit.SECONDS);
         } catch (Exception error) { if (!ending) handler.post(() -> finish("连接失败：" + error.getMessage())); }

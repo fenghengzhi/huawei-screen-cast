@@ -217,6 +217,7 @@ class ScreenMirrorCaster(
         }
     }
 
+    @Synchronized
     private fun handleFrame(data: ByteArray, info: MediaCodec.BufferInfo) {
         val config = info.flags and MediaCodec.BUFFER_FLAG_CODEC_CONFIG != 0
         val configNals = if (config) VideoParameterSets.splitAnnexB(data) else emptyList()
@@ -247,6 +248,15 @@ class ScreenMirrorCaster(
     fun writeAudioFrame(adtsFrame: ByteArray, ptsUs: Long) {
         if (withAudio) muxer.writeAudioFrame(adtsFrame, ptsUs + hlsPtsOffsetUs)
         onRawAudioFrame?.invoke(adtsFrame, ptsUs + hlsPtsOffsetUs)
+    }
+
+    /** Shares video CLOCK_MONOTONIC origin; serializes complete PES frames and HLS boundaries. */
+    @Synchronized
+    fun writeCapturedAudio(adtsFrame: ByteArray, monotonicPtsUs: Long) {
+        if (!running || ptsBase < 0 || gating) return
+        val relative = monotonicPtsUs - ptsBase
+        if (relative < hlsPtsOffsetUs) return
+        if (withAudio) muxer.writeAudioFrame(adtsFrame, relative)
     }
 
     /** 让编码器立刻产一个关键帧（新观众接入/传输丢包时用，把花屏窗口压到最短）。 */

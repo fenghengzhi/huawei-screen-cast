@@ -16,17 +16,21 @@
 
 1. 手机和机顶盒连接同一 Wi-Fi，打开机顶盒已有的投屏服务。
 2. 打开应用，搜索并选择目标电视、机顶盒或 Kodi。
-3. 点击“开始屏幕投屏”，同意系统屏幕共享授权。
+3. 点击“开始屏幕投屏”，首次使用允许录音权限，并同意系统屏幕共享授权。默认同步手机播放声音，不采集麦克风，无需额外开关。
 4. 默认“低延迟”直接提供 MPEG-TS 直播；若机顶盒不出画面，先结束投屏，再切换“兼容模式”使用 HLS。
 5. 点击“结束投屏”或通知中的“停止共享”结束录屏与本地直播服务。
 
-默认输出 960×540、20 fps、约 1.2 Mbps 的 H.264 画面，其他参数可在“画质设置”调整。不包含系统音频。HTTP 读取合并多个 TS 包，单次额外等待上限 4 ms，减少 188 字节小块发送；直播队列为 512 包。GPU 按固定时钟将最新屏幕纹理提交给硬件编码器，即使画面静止也保持连续输出。播放器本身仍会缓冲，HLS 通常更慢。受保护的视频、密码输入或安全窗口可能黑屏。
+默认输出 960×540、20 fps、约 1.2 Mbps 的 H.264 画面，其他参数可在“画质设置”调整。系统播放声音默认以 AAC-LC、48 kHz、立体声、128 kbps 传输，与视频共用单调时钟。Android 仅允许捕获同一用户下、允许被捕获的媒体/游戏等播放声音；通话、禁止音频捕获的应用及受保护内容可能无声，不会退回麦克风录音。权限拒绝或采集启动失败会明确提示。HTTP 读取合并多个 TS 包，单次额外等待上限 4 ms，减少 188 字节小块发送；直播队列为 512 包。GPU 按固定时钟将最新屏幕纹理提交给硬件编码器，即使画面静止也保持连续输出。播放器本身仍会缓冲，HLS 通常更慢。受保护的视频、密码输入或安全窗口可能黑屏。
 
 可以单独分享照片、视频和音乐：选择设备后点击“选择媒体并投屏”。通过系统文件选择器读取所选文件，缓存到应用私有目录，通过随机 URL 的本地 HTTP 服务提供给电视。支持 GET、HEAD、HTTP Range、暂停、继续及结束。单个文件最大 2 GB，不转码；媒体兼容性由机顶盒决定。结束时关闭服务器、清除缓存并释放 Wi-Fi 锁。
 
 应用的 mDNS 发现只用于协议诊断。乐联或 AirPlay 设备若没有 DLNA 服务，会标明未接入相应协议。SSDP 使用实际 Wi-Fi 网络绑定，避免 VPN 或蜂窝网络误选接口。
 
 ## 构建与测试
+
+1.5.0 默认采集系统播放声音，使用 AudioPlaybackCapture + AudioRecord + AAC 编码，与 H.264 / H.265 视频复用到 MPEG-TS 或 HLS；停止投屏时同步释放音频采集和编码器。
+
+Android 可能将所需录音权限显示为“访问麦克风”，但应用仅创建播放捕获配置，不连接麦克风音源。真机 H.265 + AAC 的 15 秒采样得到 299 个视频帧、699 个音频帧，TS 连续计数无中断；HLS 分片也包含视频和音频两条轨道。统计不代表接收端实际听感或端到端同步效果。
 
 1.4.0 在“画质设置”新增 H.264 / AVC 与 H.265 / HEVC。默认 H.264，历史配置自动沿用；编码选择与分辨率等设置一并保存，并于下次投屏生效。H.265 使用 `video/hevc` 硬件编码器、MPEG-TS HEVC 流类型和 VPS/SPS/PPS 参数集。不支持相应硬件编码器时会明确报错，不会静默改成其他编码。接收端需支持所选编码在 MPEG-TS / HLS 中的播放，兼容性不佳时可切回 H.264。
 
@@ -64,4 +68,5 @@ GitHub Actions 会在主分支和 Pull Request 自动运行构建、测试与 Li
 - [UPnP AV 架构](https://upnp.org/specs/av/UPnP-av-AVArchitecture-v1-20020612.pdf)
 - [Sony 官方 DLNA AVTransport 示例](https://github.com/sonydevworld/audio_control_api_examples/blob/master/DLNA/AVTransport/play_file.adoc)
 - [Android MediaProjection](https://developer.android.com/media/grow/media-projection)
+- [Android 音频播放捕获与限制](https://developer.android.com/media/platform/av-capture)
 - [AirSonic 编码与封装组件](https://github.com/chunguangwei/AirSonic)
