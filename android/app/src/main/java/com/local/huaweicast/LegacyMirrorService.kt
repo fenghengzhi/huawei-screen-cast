@@ -234,19 +234,19 @@ class LegacyMirrorService : Service() {
                     val encoder = ScreenMirrorCaster(width = size.width(), height = size.height(), dpi = resources.displayMetrics.densityDpi,
                         bitRate = quality.bitRate(), frameRate = quality.fps(), videoCodec = quality.codec(),
                         emit = { true }, onCodecConfig = { sps, pps ->
-                            runCatching { transport.configure(sps, pps) }.onFailure { error ->
-                                main.post { finish("H.264 参数集不适合$routeLabel：${error.message}") }
+                            try { transport.configure(sps, pps) } catch (error: Exception) {
+                                throw IllegalStateException("H.264 参数集不适合$routeLabel：${error.message}", error)
                             }
                         },
                         onHevcCodecConfig = { vps, sps, pps ->
-                            runCatching { transport.configureHevc(vps, sps, pps) }.onFailure { error ->
-                                main.post { finish("H.265 参数集不适合$routeLabel，请切换 H.264：${error.message}") }
+                            try { transport.configureHevc(vps, sps, pps) } catch (error: Exception) {
+                                throw IllegalStateException("H.265 参数集不适合$routeLabel，请切换 H.264：${error.message}", error)
                             }
                         },
                         onCapturedVideoFrame = { bytes, pts, key ->
                             lastFrameAt = SystemClock.elapsedRealtime()
                             transport.offer(bytes, pts, key)
-                        }, syncFrameIntervalMs = 1000)
+                        }, syncFrameIntervalMs = 1000, onError = { message -> main.post { finish(message) } })
                     caster = encoder
                     check(encoder.start(projection!!)) { encoder.lastError ?: "硬件编码启动失败" }
                     main.post {

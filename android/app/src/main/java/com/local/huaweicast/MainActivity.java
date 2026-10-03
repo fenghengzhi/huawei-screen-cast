@@ -82,7 +82,7 @@ public final class MainActivity extends Activity {
         RadioButton compatible = new RadioButton(this); compatible.setId(View.generateViewId()); compatible.setText("兼容模式"); compatible.setTextSize(12);
         modes.addView(low, new RadioGroup.LayoutParams(0, dp(44), 1)); modes.addView(compatible, new RadioGroup.LayoutParams(0, dp(44), 1)); modes.check("hls".equals(mirrorMode) ? compatible.getId() : low.getId());
         modes.setOnCheckedChangeListener((g,id) -> mirrorMode = id == compatible.getId() ? "hls" : "ts"); add(root, modes, 16);
-        qualityButton = button("画质设置\n" + quality.summary(), false); qualityButton.setOnClickListener(v -> editQuality()); add(root, qualityButton, 4);
+        qualityButton = button(getString(R.string.quality_button_label, quality.summary()), false); qualityButton.setOnClickListener(v -> editQuality()); add(root, qualityButton, 4);
         mirrorButton = button("开始屏幕投屏", true); mirrorButton.setEnabled(false); add(root, mirrorButton, 8); mirrorButton.setOnClickListener(v -> startMirror());
         mirrorNote = text("系统声音已开启 · 不录制麦克风", 10, MUTED, false); mirrorNote.setGravity(Gravity.CENTER); add(root, mirrorNote, 10);
         chooseButton = button("选择媒体并投屏", false); chooseButton.setEnabled(false); add(root, chooseButton, 16); chooseButton.setOnClickListener(v -> chooseMedia());
@@ -101,7 +101,7 @@ public final class MainActivity extends Activity {
         }
         renderDevices();
         if (!devices.isEmpty() || !lelinkDevices.isEmpty()) {
-            scanStatus.setText("已发现 " + devices.size() + " 个 DLNA、" + lelinkDevices.size() + " 个乐联接收端");
+            scanStatus.setText(getString(R.string.discovery_summary, devices.size(), lelinkDevices.size()));
         } else if (!otherServices.isEmpty()) scanStatus.setText("已发现其他投屏服务");
         updateMedia(); updateNetwork();
         if (bundle == null && retained == null) root.post(this::scan);
@@ -132,7 +132,7 @@ public final class MainActivity extends Activity {
         scanning = true; devices.clear(); otherServices.clear(); lelinkDevices.clear(); raopServices.clear(); selected = null; renderDevices(); updateMedia(); scanButton.setEnabled(false); scanStatus.setText("正在通过手机网络搜索接收端…");
         WifiManager wifi = (WifiManager) getApplicationContext().getSystemService(WIFI_SERVICE);
         multicastLock = wifi.createMulticastLock("HuaweiCast:discovery"); multicastLock.setReferenceCounted(false);
-        try { multicastLock.acquire(); } catch (Exception error) { scanning = false; scanButton.setEnabled(true); scanStatus.setText("无法启用组播搜索：" + error.getMessage()); return; }
+        try { multicastLock.acquire(); } catch (Exception error) { scanning = false; scanButton.setEnabled(true); scanStatus.setText(getString(R.string.discovery_multicast_failed, error.getMessage())); return; }
         if (serviceDiscovery != null) serviceDiscovery.stop();
         serviceDiscovery = new ServiceDiscovery(this, new ServiceDiscovery.Listener() {
             @Override public void diagnostic(String message) { android.util.Log.i("HuaweiCastDiscovery", message); }
@@ -181,7 +181,7 @@ public final class MainActivity extends Activity {
                     devices.put(device.id().isEmpty() ? device.controlUrl() : device.id(), device);
                     if (selected == null || device.name().contains("电信")) selected = device;
                     renderDevices(); updateMedia();
-                    scanStatus.setText("已发现 " + devices.size() + " 个 DLNA 接收端");
+                    scanStatus.setText(getString(R.string.dlna_discovery_count, devices.size()));
                 }); }
                 }, socket -> {
                     ConnectivityManager manager = getSystemService(ConnectivityManager.class);
@@ -199,7 +199,7 @@ public final class MainActivity extends Activity {
     private void renderDevices() {
         deviceList.removeAllViews();
         for (Dlna.Device device : devices.values()) {
-            RadioButton row = new RadioButton(this); row.setText(device.name() + "\nDLNA 接收端"); row.setTextSize(13); row.setTextColor(DARK); row.setPadding(dp(10),dp(14),dp(10),dp(14)); row.setBackground(background(Color.WHITE, LINE, 5));
+            RadioButton row = new RadioButton(this); row.setText(getString(R.string.dlna_receiver_label, device.name())); row.setTextSize(13); row.setTextColor(DARK); row.setPadding(dp(10),dp(14),dp(10),dp(14)); row.setBackground(background(Color.WHITE, LINE, 5));
             row.setChecked(selected != null && selected.controlUrl().equals(device.controlUrl()));
             row.setEnabled(!castingBusy());
             row.setOnClickListener(v -> { selected = device; renderDevices(); updateMedia(); }); add(deviceList, row, 7);
@@ -396,8 +396,8 @@ public final class MainActivity extends Activity {
             try {
                 Dlna.Device device = Dlna.describe(address);
                 if (device == null) throw new IllegalArgumentException("该设备没有 DLNA AVTransport 服务");
-                runOnUiThread(() -> { if (!destroyed) { devices.put(device.id().isEmpty() ? device.controlUrl() : device.id(), device); selected = device; renderDevices(); updateMedia(); scanStatus.setText("已验证设备：" + device.name()); } });
-            } catch (Exception error) { runOnUiThread(() -> { if (!destroyed) scanStatus.setText("设备地址不可用：" + error.getMessage()); }); }
+                runOnUiThread(() -> { if (!destroyed) { devices.put(device.id().isEmpty() ? device.controlUrl() : device.id(), device); selected = device; renderDevices(); updateMedia(); scanStatus.setText(getString(R.string.device_verified, device.name())); } });
+            } catch (Exception error) { runOnUiThread(() -> { if (!destroyed) scanStatus.setText(getString(R.string.device_address_failed, error.getMessage())); }); }
         });
     }
     private void updateMedia() {
@@ -455,7 +455,7 @@ public final class MainActivity extends Activity {
         AlertDialog dialog = new AlertDialog.Builder(this).setTitle("画质设置").setView(viewport).setNegativeButton("取消", null).setNeutralButton("恢复默认", null).setPositiveButton("保存", (d,w) -> {
             quality = new CastQuality(CastQuality.HEIGHTS[resolution.getSelectedItemPosition()], CastQuality.FRAME_RATES[rate.getSelectedItemPosition()], 500 + bitrate.getProgress()*100, codec.getSelectedItemPosition() == 1 ? VideoCodec.H265 : VideoCodec.H264);
             getSharedPreferences("cast", MODE_PRIVATE).edit().putInt("height", quality.height()).putInt("fps", quality.fps()).putInt("kbps", quality.kbps()).putString("codec", quality.codec().id()).apply();
-            qualityButton.setText("画质设置\n" + quality.summary());
+            qualityButton.setText(getString(R.string.quality_button_label, quality.summary()));
         }).create();
         dialog.setOnShowListener(d -> dialog.getButton(AlertDialog.BUTTON_NEUTRAL).setOnClickListener(v -> { codec.setSelection(0); resolution.setSelection(1); rate.setSelection(1); bitrate.setProgress(7); }));
         dialog.show();

@@ -163,7 +163,7 @@ public final class LegacyMirrorClient implements MirrorVideoTransport {
             + "\r\nContent-Length: " + info.length + "\r\n\r\n";
         OutputStream out = tcp.getOutputStream();
         lastWriteNs = System.nanoTime();
-        watchdog.scheduleAtFixedRate(() -> {
+        watchdog.scheduleWithFixedDelay(() -> {
             if (!closed.get() && System.nanoTime() - lastWriteNs > TimeUnit.SECONDS.toNanos(5)) fail("镜像连接写入超时");
         }, 1, 1, TimeUnit.SECONDS);
         // Use the same identity from the first HTTP request so receivers can associate it with RTSP.

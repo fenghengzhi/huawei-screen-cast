@@ -30,6 +30,7 @@ public final class MirrorHttpServer extends NanoHTTPD {
         return accepted;
     }
     public synchronized void boundary(long pts) {
+        if (ended) return;
         if (startPts >= 0 && current.size() > 0) {
             segments.put(sequence++, new Segment(current.toByteArray(), Math.max(.05, (pts - startPts) / 1000000.0)));
             while (segments.size() > 8) segments.remove(segments.keySet().iterator().next());
@@ -43,11 +44,18 @@ public final class MirrorHttpServer extends NanoHTTPD {
         String uri = request.getUri();
         if (!uri.startsWith(basePath + "/")) return newFixedLengthResponse(Response.Status.NOT_FOUND, "text/plain", "Not found");
         if (request.getMethod() != Method.GET && request.getMethod() != Method.HEAD) return newFixedLengthResponse(Response.Status.METHOD_NOT_ALLOWED, "text/plain", "GET or HEAD required");
+        if (ended) return unavailable();
         if (uri.equals(basePath + "/screen.ts")) {
             lastRequest = System.currentTimeMillis();
             if (request.getMethod() == Method.HEAD) return newFixedLengthResponse(Response.Status.OK, "video/mp2t", "");
-            if (clients.size() >= 3) return newFixedLengthResponse(Response.Status.SERVICE_UNAVAILABLE, "text/plain", "Too many streams");
-            LiveInput input = new LiveInput(); clients.add(input); onJoin.run();
+            LiveInput input;
+            synchronized (this) {
+                if (ended) return unavailable();
+                if (clients.size() >= 3) return newFixedLengthResponse(Response.Status.SERVICE_UNAVAILABLE, "text/plain", "Too many streams");
+                input = new LiveInput(); clients.add(input);
+            }
+            try { onJoin.run(); }
+            catch (RuntimeException | Error error) { input.close(); throw error; }
             Response response = newChunkedResponse(Response.Status.OK, "video/mp2t", input);
             response.addHeader("Cache-Control", "no-store"); response.addHeader("transferMode.dlna.org", "Streaming");
             return response;
@@ -76,12 +84,24 @@ public final class MirrorHttpServer extends NanoHTTPD {
             response.addHeader("Cache-Control", "no-store"); return response;
         } catch (IllegalArgumentException error) { return newFixedLengthResponse(Response.Status.NOT_FOUND, "text/plain", "Not found"); }
     }
-    @Override public void stop() { ended = true; for (LiveInput client : clients) client.close(); clients.clear(); super.stop(); synchronized (this) { segments.clear(); current.reset(); } }
+    private static Response unavailable() {
+        return newFixedLengthResponse(Response.Status.SERVICE_UNAVAILABLE, "text/plain", "Stream ended");
+    }
+    @Override public void stop() {
+        synchronized (this) {
+            ended = true;
+            for (LiveInput client : clients) client.close();
+            clients.clear(); segments.clear(); current.reset();
+        }
+        super.stop();
+    }
     private final class LiveInput extends InputStream {
         final ArrayBlockingQueue<byte[]> queue = new ArrayBlockingQueue<>(512);
         byte[] packet; int offset; volatile boolean closed;
         @Override public int read() throws IOException { byte[] one = new byte[1]; return read(one, 0, 1) == -1 ? -1 : one[0] & 255; }
         @Override public int read(byte[] buffer, int off, int len) throws IOException {
+            Objects.requireNonNull(buffer, "buffer");
+            if (off < 0 || len < 0 || off > buffer.length - len) throw new IndexOutOfBoundsException();
             if (len == 0) return 0;
             int copied = 0;
             long deadline = 0;

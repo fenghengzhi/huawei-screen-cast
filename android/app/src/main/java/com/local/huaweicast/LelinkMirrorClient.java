@@ -169,7 +169,7 @@ public final class LelinkMirrorClient implements MirrorVideoTransport {
         requireOpen();
         OutputStream output = media.getOutputStream();
         connected = true;
-        watchdog.scheduleAtFixedRate(() -> {
+        watchdog.scheduleWithFixedDelay(() -> {
             long started = writeStartedNs;
             if (!closed.get() && started != 0 && System.nanoTime() - started > WRITE_TIMEOUT_NS) {
                 fail("Lelink media write timed out");

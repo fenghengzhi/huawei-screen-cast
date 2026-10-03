@@ -1,0 +1,10 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="quality_button_label">画质设置\n%1$s</string>
+    <string name="discovery_summary">已发现 %1$d 个 DLNA、%2$d 个乐联接收端</string>
+    <string name="discovery_multicast_failed">无法启用组播搜索：%1$s</string>
+    <string name="dlna_discovery_count">已发现 %1$d 个 DLNA 接收端</string>
+    <string name="dlna_receiver_label">%1$s\nDLNA 接收端</string>
+    <string name="device_verified">已验证设备：%1$s</string>
+    <string name="device_address_failed">设备地址不可用：%1$s</string>
+</resources>

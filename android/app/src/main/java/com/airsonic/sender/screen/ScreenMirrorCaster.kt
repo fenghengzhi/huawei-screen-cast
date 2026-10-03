@@ -58,6 +58,8 @@ class ScreenMirrorCaster(
     private val onRawAudioFrame: ((adtsFrame: ByteArray, ptsUs: Long) -> Unit)? = null,
     private val onCapturedVideoFrame: ((data: ByteArray, monotonicUs: Long, keyframe: Boolean) -> Unit)? = null,
     private val onHevcCodecConfig: ((vps: ByteArray, sps: ByteArray, pps: ByteArray) -> Unit)? = null,
+    /** Called on the drain thread; enqueue service shutdown rather than stopping inline. */
+    private val onError: (String) -> Unit = {},
 ) {
     private val lifecycleLock = Any()
     @Volatile private var codec: MediaCodec? = null
@@ -82,7 +84,8 @@ class ScreenMirrorCaster(
     }
     private val muxer = TsMuxer(audioPid = if (withAudio) 0x102 else null, videoCodec = videoCodec, onPacket = packetSink)
     private var parameterSets = VideoParameterSets(videoCodec)
-    @Volatile private var running = false
+    @Volatile private var encoderRun: EncoderRun? = null
+    private val running: Boolean get() = encoderRun?.running == true
     private var drainThread: Thread? = null
     private var syncThread: Thread? = null
     /** 编码器是否已产出所选格式的完整参数集。 */
@@ -221,14 +224,22 @@ class ScreenMirrorCaster(
             surface.release(); inputSurface = null
             return false
         }
-        running = true
-        drainThread = thread(isDaemon = true, name = "airsonic-screen-drain") { drainLoop(c) }
+        val run = EncoderRun { error ->
+            val message = "编码输出失败：${error.javaClass.simpleName} ${error.message}"
+            ready = false
+            lastError = message
+            onError(message)
+            onLog(message)
+        }
+        encoderRun = run
+        val renderer = checkNotNull(frameRepeater)
+        drainThread = thread(isDaemon = true, name = "airsonic-screen-drain") { drainLoop(c, run, renderer) }
         if (syncFrameIntervalMs > 0) {
             // HLS 降延迟：周期强制关键帧 → 分片边界密度 = 该周期（独立于拥塞恢复的节流通道）
             syncThread = thread(isDaemon = true, name = "airsonic-sync-tick") {
-                while (running && codec === c) {
+                while (run.running && codec === c) {
                     try { Thread.sleep(syncFrameIntervalMs) } catch (_: InterruptedException) { break }
-                    if (!running || codec !== c) break
+                    if (!run.running || codec !== c) break
                     runCatching {
                         c.setParameters(android.os.Bundle().apply {
                             putInt(MediaCodec.PARAMETER_KEY_REQUEST_SYNC_FRAME, 0)
@@ -241,10 +252,11 @@ class ScreenMirrorCaster(
         return true
     }
 
-    private fun drainLoop(c: MediaCodec) {
+    private fun drainLoop(c: MediaCodec, run: EncoderRun, renderer: com.local.huaweicast.FrameRepeater) {
         val info = MediaCodec.BufferInfo()
-        while (running && codec === c) {
+        while (run.running && codec === c) {
             try {
+                renderer.failure?.let { throw it }
                 val idx = c.dequeueOutputBuffer(info, 10_000)
                 when {
                     idx == MediaCodec.INFO_OUTPUT_FORMAT_CHANGED -> {
@@ -257,22 +269,19 @@ class ScreenMirrorCaster(
                         }
                     }
                     idx >= 0 -> {
-                        val buf = c.getOutputBuffer(idx)
-                        if (buf != null && info.size > 0) {
-                            val data = ByteArray(info.size)
-                            buf.position(info.offset); buf.limit(info.offset + info.size)
-                            buf.get(data)
-                            // handleFrame 内含 muxer/SPS 解析等可能抛异常的链路（尤其畸形输入），
-                            // 绝不能让它杀死 drain 线程——编码器无人消费 = 镜像无声冻屏
-                            try { handleFrame(data, info) } catch (t: Throwable) {
-                                onLog("handleFrame 异常已吞: ${t.javaClass.simpleName} ${t.message}")
+                        consumeEncoderOutput(release = { c.releaseOutputBuffer(idx, false) }) {
+                            if (info.size > 0) {
+                                val buf = checkNotNull(c.getOutputBuffer(idx)) { "编码器未提供输出缓冲区" }
+                                val data = ByteArray(info.size)
+                                buf.position(info.offset); buf.limit(info.offset + info.size)
+                                buf.get(data)
+                                handleFrame(data, info)
                             }
                         }
-                        c.releaseOutputBuffer(idx, false)
                     }
                 }
             } catch (error: Exception) {
-                if (running && codec === c) onLog("编码输出异常: ${error.javaClass.simpleName} ${error.message}")
+                run.fail(error)
                 break
             }
         }
@@ -355,10 +364,13 @@ class ScreenMirrorCaster(
     }
 
     private fun stopEncoder(): Boolean {
+        val run = encoderRun
+        run?.beginStop()
         runCatching { display?.surface = null }
         // Keep draining while the renderer finishes its last EGL swap.
         runCatching { frameRepeater?.release() }; frameRepeater = null
-        running = false
+        run?.stop()
+        ready = false
         syncThread?.interrupt()
         val drain = drainThread
         val sync = syncThread
@@ -370,6 +382,7 @@ class ScreenMirrorCaster(
         }
         val stoppedCodec = codec
         codec = null
+        encoderRun = null
         runCatching { stoppedCodec?.stop() }
         runCatching { stoppedCodec?.release() }
         runCatching { inputSurface?.release() }; inputSurface = null
@@ -397,5 +410,46 @@ class ScreenMirrorCaster(
         }
         if (!ready) onLog("${videoCodec.label()} 参数集已就绪")
         ready = true
+    }
+}
+
+/** One encoder generation: stopping suppresses failures before its renderer and drain are joined. */
+internal class EncoderRun(private val onFailure: (Exception) -> Unit) {
+    @Volatile var running = true
+        private set
+    private var reportFailure = true
+
+    @Synchronized fun beginStop() {
+        reportFailure = false
+    }
+
+    @Synchronized fun stop() {
+        reportFailure = false
+        running = false
+    }
+
+    @Synchronized fun fail(error: Exception) {
+        if (!reportFailure) return
+        reportFailure = false
+        running = false
+        onFailure(error)
+    }
+}
+
+/** Returning an output slot is mandatory even if parsing or a downstream callback fails. */
+internal inline fun consumeEncoderOutput(release: () -> Unit, consume: () -> Unit) {
+    var failure: Throwable? = null
+    try {
+        consume()
+    } catch (error: Throwable) {
+        failure = error
+        throw error
+    } finally {
+        try {
+            release()
+        } catch (releaseError: Throwable) {
+            if (failure == null) throw releaseError
+            if (failure !== releaseError) failure.addSuppressed(releaseError)
+        }
     }
 }

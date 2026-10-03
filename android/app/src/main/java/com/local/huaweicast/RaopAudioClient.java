@@ -209,7 +209,7 @@ public final class RaopAudioClient implements AutoCloseable {
     }
 
     private void startWatchdog() {
-        watchdog.scheduleAtFixedRate(() -> {
+        watchdog.scheduleWithFixedDelay(() -> {
             long since = requestStartedNs;
             if (since != 0 && System.nanoTime() - since >= REQUEST_NS && !closed.get()) fail("接收端声音握手或响应超时");
             for (long writeStart : pendingWrites.values()) {

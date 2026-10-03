@@ -108,10 +108,16 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
+          assets=(
+            "dist/huawei-screen-cast-${RELEASE_TAG#v}.apk"
+            "dist/fdk-aac-2.0.3-source.zip"
+            "dist/THIRD-PARTY-NOTICES.txt"
+            "dist/SHA256SUMS.txt"
+          )
           if gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
-            gh release upload "$RELEASE_TAG" dist/* --clobber
+            gh release upload "$RELEASE_TAG" "${assets[@]}" --clobber
           else
-            gh release create "$RELEASE_TAG" dist/* --verify-tag --title "Huawei Screen Cast $RELEASE_TAG" --notes-file RELEASE_NOTES.md
+            gh release create "$RELEASE_TAG" "${assets[@]}" --verify-tag --title "Huawei Screen Cast $RELEASE_TAG" --notes-file RELEASE_NOTES.md
           fi
       - name: Remove temporary signing key
         if: always()

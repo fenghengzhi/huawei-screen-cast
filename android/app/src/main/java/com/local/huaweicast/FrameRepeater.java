@@ -11,6 +11,7 @@ import java.util.concurrent.*;
 public final class FrameRepeater {
     private final HandlerThread thread = new HandlerThread("cast-frame-clock");
     private final Handler handler;
+    private final ThreadBoundCleanup releaseTask;
     private final Surface encoderSurface;
     private final int width, height, fps;
     private EGLDisplay display = EGL14.EGL_NO_DISPLAY;
@@ -29,9 +30,23 @@ public final class FrameRepeater {
         this.encoderSurface = encoderSurface; this.width = width; this.height = height; this.fps = fps;
         vertices.put(new float[]{-1,-1,0,0, 1,-1,1,0, -1,1,0,1, 1,1,1,1}).position(0);
         thread.start(); handler = new Handler(thread.getLooper());
+        releaseTask = new ThreadBoundCleanup(() -> Thread.currentThread() == thread, task -> {
+            if (!handler.post(task)) throw new IllegalStateException("渲染线程已停止，无法安排清理");
+        }, () -> {
+            stopped = true;
+            handler.removeCallbacksAndMessages(null);
+            try { cleanup(); }
+            finally { thread.quitSafely(); }
+        });
         CountDownLatch ready = new CountDownLatch(1);
-        handler.post(() -> { try { initialize(); } catch (RuntimeException error) { failure = error; cleanup(); } finally { ready.countDown(); } });
-        if (!ready.await(5, TimeUnit.SECONDS)) { release(); throw new IllegalStateException("GPU 初始化超时"); }
+        handler.post(() -> { try { initialize(); } catch (RuntimeException error) { failure = error; release(); } finally { ready.countDown(); } });
+        try {
+            if (!ready.await(5, TimeUnit.SECONDS)) { release(); throw new IllegalStateException("GPU 初始化超时"); }
+        } catch (InterruptedException error) {
+            Thread.currentThread().interrupt();
+            release();
+            throw error;
+        }
         if (failure != null) { release(); throw failure; }
     }
     public Surface getSurface() { return source; }
@@ -88,9 +103,7 @@ public final class FrameRepeater {
         } catch (RuntimeException error) { failure = error; stopped = true; android.util.Log.e("ScreenMirror", "固定帧率渲染失败", error); }
     }
     public void release() {
-        CountDownLatch done = new CountDownLatch(1);
-        handler.post(() -> { stopped = true; handler.removeCallbacksAndMessages(null); cleanup(); done.countDown(); thread.quitSafely(); });
-        try { done.await(2, TimeUnit.SECONDS); } catch (InterruptedException error) { Thread.currentThread().interrupt(); }
+        releaseTask.release(2, TimeUnit.SECONDS);
     }
     private void cleanup() {
         if (source != null) { source.release(); source = null; }

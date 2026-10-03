@@ -15,7 +15,7 @@
 
 本次发布已创建并配置这些 Secret。用于恢复的本机备份位于项目根目录 `.signing/`，已加入忽略规则，不会提交到公开仓库。请在自己的安全存储中备份；后续覆盖更新必须保留同一签名证书。
 
-私钥仅在发布 job 中还原到 runner 临时目录，任务结束时删除。APK 内包含完整第三方许可文本，Release 同时附带许可声明和 SHA-256 校验文件。
+私钥仅在发布 job 中还原到 runner 临时目录，任务结束时删除。APK 内包含完整第三方许可文本，Release 同时附带许可声明和 SHA-256 校验文件；许可汇总包含 Bouncy Castle 的完整 MIT 文本。
 
 兼容镜像音频使用原生 FDK-AAC 编码器，构建固定使用 NDK `28.2.13676358` 和 CMake `3.22.1`。工作流会安装这两个组件。APK 的 `assets/licenses` 同时包含 FDK 的完整许可和完整源码压缩包；发布时不要删除这些材料。FDK 软件许可不包含 AAC 专利许可。
 
@@ -31,6 +31,13 @@ git push origin v1.3.1
 ```
 
 标签与 APK 的版本号不匹配时发布会失败。必要时可在 Actions 手动选择已有版本标签重新运行；不选择标签时只执行构建检查。
+
+打包脚本还会检查应用 ID、release 变体、APK 类型、单一通用包、正整数版本号、输出路径以及必需文件非空；所有输入验证完成后才替换本地发布产物。CI 的 `apksigner verify` 独立验证签名，文件名本身不构成签名证明。发布步骤仅上传以下四项，不会使用 `dist/*` 将调试 APK 或本地分析材料误传到 Release：
+
+- `huawei-screen-cast-<version>.apk`
+- `fdk-aac-2.0.3-source.zip`
+- `THIRD-PARTY-NOTICES.txt`
+- `SHA256SUMS.txt`
 
 ## 本地签名构建
 

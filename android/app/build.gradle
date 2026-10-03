@@ -7,6 +7,11 @@ android {
     defaultConfig { applicationId 'com.local.huaweicast'; minSdk 29; targetSdk 35; versionCode 12; versionName '1.6.0-beta.5' }
     externalNativeBuild { cmake { path file('src/main/cpp/CMakeLists.txt'); version '3.22.1' } }
     compileOptions { coreLibraryDesugaringEnabled true; sourceCompatibility JavaVersion.VERSION_17; targetCompatibility JavaVersion.VERSION_17 }
+    lint {
+        abortOnError true
+        warningsAsErrors true
+        baseline file('lint-baseline.xml')
+    }
     if (releaseKeystore != null) {
         signingConfigs {
             release {

@@ -1,0 +1,37 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<issues format="6" by="lint 9.1.0" type="baseline" client="gradle" dependencies="false" name="AGP (9.1.0)" variant="all" version="9.1.0">
+
+    <issue
+        id="OldTargetApi"
+        message="Not targeting the latest versions of Android; compatibility modes apply. Consider testing and updating this version. Consult the `android.os.Build.VERSION_CODES` javadoc for details."
+        errorLine1="    defaultConfig { applicationId &apos;com.local.huaweicast&apos;; minSdk 29; targetSdk 35; versionCode 12; versionName &apos;1.6.0-beta.5&apos; }"
+        errorLine2="                                                                     ~~~~~~~~~~~~">
+        <location
+            file="build.gradle"
+            line="7"
+            column="70"/>
+    </issue>
+
+    <issue
+        id="AndroidGradlePluginVersion"
+        message="A newer version of Gradle than 9.3.1 is available: 9.8.0"
+        errorLine1="distributionUrl=https\://services.gradle.org/distributions/gradle-9.3.1-all.zip"
+        errorLine2="                ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~">
+        <location
+            file="../gradle/wrapper/gradle-wrapper.properties"
+            line="3"
+            column="17"/>
+    </issue>
+
+    <issue
+        id="UsableSpace"
+        message="Consider also using `StorageManager#getAllocatableBytes` and `allocateBytes` which will consider clearable cached data"
+        errorLine1="                    if (total > 2L * 1024 * 1024 * 1024 || getCacheDir().getUsableSpace() &lt; 20 * 1024 * 1024) throw new IOException(&quot;文件过大或存储空间不足（最大 2 GB）&quot;);"
+        errorLine2="                                                                         ~~~~~~~~~~~~~~">
+        <location
+            file="src/main/java/com/local/huaweicast/MediaService.java"
+            line="72"
+            column="74"/>
+    </issue>
+
+</issues>
