@@ -16,7 +16,7 @@ import java.util.Set;
 public final class LelinkEndpoint {
     private static final int MAX_TEXT_BYTES = 255;
     private static final int MAX_TXT_ENTRIES = 64;
-    private static final Set<String> METADATA_KEYS = Set.of("version", "ver", "hmd", "features", "width", "height");
+    private static final Set<String> METADATA_KEYS = Set.of("version", "ver", "hmd", "features", "width", "height", "htv", "atv");
     private static final Set<String> PORT_KEYS = Set.of("lelinkport", "remote", "mirror", "raop");
 
     private final String name;
@@ -25,15 +25,17 @@ public final class LelinkEndpoint {
     private final OptionalInt mirrorPort;
     private final OptionalInt raopPort;
     private final Map<String, String> metadata;
+    private final boolean explicitLelinkPort;
 
     private LelinkEndpoint(String name, InetAddress address, int controlPort,
-                           OptionalInt mirrorPort, OptionalInt raopPort, Map<String, String> metadata) {
+                           OptionalInt mirrorPort, OptionalInt raopPort, Map<String, String> metadata, boolean explicitLelinkPort) {
         this.name = name;
         this.address = address;
         this.controlPort = controlPort;
         this.mirrorPort = mirrorPort;
         this.raopPort = raopPort;
         this.metadata = Map.copyOf(metadata);
+        this.explicitLelinkPort = explicitLelinkPort;
     }
 
     public static LelinkEndpoint from(String serviceName, InetAddress address, int srvPort,
@@ -68,7 +70,7 @@ public final class LelinkEndpoint {
         for (String key : METADATA_KEYS) {
             if (accepted.containsKey(key)) metadata.put(key, accepted.get(key));
         }
-        return new LelinkEndpoint(name, address, controlPort, mirrorPort, raopPort, metadata);
+        return new LelinkEndpoint(name, address, controlPort, mirrorPort, raopPort, metadata, accepted.containsKey("lelinkport"));
     }
 
     private static void validateAddress(InetAddress address) {
@@ -130,6 +132,10 @@ public final class LelinkEndpoint {
     public OptionalInt mirrorPort() { return mirrorPort; }
     public OptionalInt raopPort() { return raopPort; }
     public Map<String, String> metadata() { return metadata; }
+    /** A discovery claim only; the peer must still complete the native cryptographic handshake. */
+    public boolean advertisesFreeNativePairing() {
+        return explicitLelinkPort && "1".equals(metadata.get("htv")) && "0".equals(metadata.get("atv"));
+    }
     public String key() {
         String host = address.getHostAddress();
         return (address instanceof Inet6Address ? "[" + host + "]" : host) + ":" + controlPort;

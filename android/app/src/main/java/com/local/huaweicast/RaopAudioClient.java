@@ -10,8 +10,9 @@ import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.locks.ReentrantLock;
 import java.util.function.Consumer;
+import java.util.function.UnaryOperator;
 
-/** Plaintext legacy RAOP audio for receivers that explicitly advertise encryption type zero. */
+/** AAC-ELD UDP transport for plaintext legacy RAOP or an independently negotiated native session. */
 public final class RaopAudioClient implements AutoCloseable {
     public static final class AuthorizationRequiredException extends IOException {
         public AuthorizationRequiredException() { super("接收端要求授权，声音连接已停止"); }
@@ -19,6 +20,10 @@ public final class RaopAudioClient implements AutoCloseable {
     interface SocketFactory {
         Socket tcp() throws IOException;
         DatagramSocket udp() throws IOException;
+    }
+    public record NativePorts(int dataPort, int controlPort, int timingPort) {}
+    @FunctionalInterface public interface NativeSetup {
+        NativePorts negotiate(int localControlPort, int localTimingPort) throws IOException;
     }
     private record Frame(byte[] bytes, long ptsUs, long queuedNs, long index) {}
     private record CachedPacket(int sequence, byte[] bytes, long sentNs) {}
@@ -53,6 +58,8 @@ public final class RaopAudioClient implements AutoCloseable {
     private long keepaliveMs = 10000;
     private volatile boolean ready;
     private String uri, receiverSession;
+    private UnaryOperator<byte[]> encryptPayload;
+    private boolean nativeTransport;
 
     public RaopAudioClient(LegacyMirrorSession session, int sampleRate, int samplesPerFrame,
                            byte[] audioSpecificConfig, Consumer<String> failure) {
@@ -109,9 +116,8 @@ public final class RaopAudioClient implements AutoCloseable {
     public void connect(InetAddress peer, int advertisedPort, LegacyMirrorClient.Binder binder) throws IOException {
         if (!started.compareAndSet(false, true)) throw new IOException("声音连接已启动");
         try {
-            if (peer == null || peer.isAnyLocalAddress() || peer.isLoopbackAddress() || peer.isMulticastAddress()
-                    || !(peer.isSiteLocalAddress() || peer.isLinkLocalAddress() || isUniqueLocal(peer))
-                    || advertisedPort < 1 || advertisedPort > 65535) throw new IOException("无效的本地声音接收端");
+            validatePeer(peer);
+            if (!validPort(advertisedPort)) throw new IOException("无效的本地声音接收端");
             this.peer = peer;
             ensureOpen();
             data = openUdp(binder); control = openUdp(binder); timing = openUdp(binder);
@@ -119,13 +125,7 @@ public final class RaopAudioClient implements AutoCloseable {
             ensureOpen(); binder.bind(socket);
             socket.connect(new InetSocketAddress(peer, advertisedPort), 2500);
             socket.setTcpNoDelay(true); socket.setSoTimeout(250);
-            watchdog.scheduleAtFixedRate(() -> {
-                long since = requestStartedNs;
-                if (since != 0 && System.nanoTime() - since >= REQUEST_NS && !closed.get()) fail("接收端声音握手或响应超时");
-                for (long writeStart : pendingWrites.values()) {
-                    if (System.nanoTime() - writeStart >= REQUEST_NS && !closed.get()) fail("声音数据发送超时");
-                }
-            }, 100, 100, TimeUnit.MILLISECONDS);
+            startWatchdog();
             String host = peer.getHostAddress();
             uri = "rtsp://" + (host.contains(":") ? "[" + host + "]" : host) + "/" + session.sessionId();
             request("ANNOUNCE", uri, Map.of("Content-Type", "application/sdp"), sdp(socket.getLocalAddress()));
@@ -169,6 +169,61 @@ public final class RaopAudioClient implements AutoCloseable {
             clearLocalResources(); closeSocket(tcp);
             throw error;
         }
+    }
+
+    /** The caller owns the native control session; this path never opens a legacy RTSP connection. */
+    public void connectNative(InetAddress peer, LegacyMirrorClient.Binder binder, NativeSetup setup,
+                              UnaryOperator<byte[]> encryptPayload) throws IOException {
+        if (!started.compareAndSet(false, true)) throw new IOException("声音连接已启动");
+        try {
+            validatePeer(peer);
+            Objects.requireNonNull(binder, "Missing socket binder");
+            Objects.requireNonNull(setup, "Missing native audio setup");
+            this.encryptPayload = Objects.requireNonNull(encryptPayload, "Missing audio encryptor");
+            nativeTransport = true;
+            this.peer = peer;
+            ensureOpen();
+            data = openUdp(binder); control = openUdp(binder); timing = openUdp(binder);
+            ensureOpen();
+            startWatchdog();
+            NativePorts ports;
+            requestStartedNs = System.nanoTime();
+            try { ports = setup.negotiate(control.getLocalPort(), timing.getLocalPort()); }
+            finally { requestStartedNs = 0; }
+            ensureOpen();
+            if (ports == null || !validPort(ports.dataPort()) || !validPort(ports.controlPort())
+                    || !validPort(ports.timingPort())) throw new IOException("声音接收端返回无效端口");
+            dataPort = ports.dataPort(); controlPort = ports.controlPort(); timingPort = ports.timingPort();
+            data.connect(peer, dataPort); control.connect(peer, controlPort); timing.connect(peer, timingPort);
+            ensureOpen();
+            ready = true;
+            start("raop-timing", this::timingLoop);
+            start("raop-audio", this::audioLoop);
+            start("raop-resend", this::resendLoop);
+        } catch (IOException | RuntimeException error) {
+            closeImmediately();
+            // Cancellation can race with a socket being assigned after allocation.
+            clearLocalResources();
+            throw error;
+        }
+    }
+
+    private void startWatchdog() {
+        watchdog.scheduleAtFixedRate(() -> {
+            long since = requestStartedNs;
+            if (since != 0 && System.nanoTime() - since >= REQUEST_NS && !closed.get()) fail("接收端声音握手或响应超时");
+            for (long writeStart : pendingWrites.values()) {
+                if (System.nanoTime() - writeStart >= REQUEST_NS && !closed.get()) fail("声音数据发送超时");
+            }
+        }, 100, 100, TimeUnit.MILLISECONDS);
+    }
+
+    private static boolean validPort(int port) { return port >= 1 && port <= 65535; }
+
+    private static void validatePeer(InetAddress peer) throws IOException {
+        if (peer == null || peer.isAnyLocalAddress() || peer.isLoopbackAddress() || peer.isMulticastAddress()
+                || !(peer.isSiteLocalAddress() || peer.isLinkLocalAddress() || isUniqueLocal(peer)))
+            throw new IOException("无效的本地声音接收端");
     }
 
     private static boolean isUniqueLocal(InetAddress address) {
@@ -377,7 +432,10 @@ public final class RaopAudioClient implements AutoCloseable {
                 syncSequence = RaopAudioWire.nextSequence(syncSequence);
                 send(control, sync, controlPort); lastSyncNs = now;
             }
-            byte[] packet = RaopAudioWire.audioPacket(frame.bytes(), audioSequence, timestamp, ssrc, first);
+            byte[] payload = encryptPayload == null ? frame.bytes() : encryptPayload.apply(frame.bytes());
+            if (payload == null || payload.length == 0 || payload.length > MAX_FRAME_BYTES)
+                throw new IOException("无效的声音加密数据");
+            byte[] packet = RaopAudioWire.audioPacket(payload, audioSequence, timestamp, ssrc, first);
             send(data, packet, dataPort);
             synchronized (history) { history[audioSequence % history.length] = new CachedPacket(audioSequence, packet, now); }
             audioSequence = RaopAudioWire.nextSequence(audioSequence);
@@ -390,11 +448,16 @@ public final class RaopAudioClient implements AutoCloseable {
         while (!closed.get()) {
             DatagramPacket packet = receive(timing, buffer);
             if (packet == null) continue;
-            long received = RaopAudioWire.ntpTimestampUs(session.nowUs());
+            long receivedUs = session.nowUs();
             byte[] request = Arrays.copyOf(packet.getData(), packet.getLength());
             try {
-                RaopAudioWire.parseTimingRequest(request);
-                send(timing, RaopAudioWire.timingReply(request, received, RaopAudioWire.ntpTimestampUs(session.nowUs())), timingPort);
+                if (nativeTransport && request.length == 48) {
+                    send(timing, LegacyMirrorWire.ntpReply(request, receivedUs, session.nowUs()), timingPort);
+                } else {
+                    RaopAudioWire.parseTimingRequest(request);
+                    send(timing, RaopAudioWire.timingReply(request, RaopAudioWire.ntpTimestampUs(receivedUs),
+                            RaopAudioWire.ntpTimestampUs(session.nowUs())), timingPort);
+                }
                 timingReplies++;
             } catch (IllegalArgumentException ignored) { /* Unrelated or malformed UDP data. */ }
         }

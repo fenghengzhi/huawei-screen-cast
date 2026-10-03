@@ -74,7 +74,7 @@ public final class MainActivity extends Activity {
         LinearLayout mediaHeader = new LinearLayout(this); mediaHeader.setGravity(Gravity.CENTER_VERTICAL);
         TextView mediaTitle = text("接收设备", 18, DARK, true); mediaHeader.addView(mediaTitle, new LinearLayout.LayoutParams(0, -2, 1));
         scanButton = button("搜索", false); mediaHeader.addView(scanButton, new LinearLayout.LayoutParams(dp(72), dp(39))); scanButton.setOnClickListener(v -> scan()); add(root, mediaHeader, 24);
-        add(root, text("DLNA 投屏 · 乐播兼容镜像", 11, MUTED, false), 8);
+        add(root, text("DLNA · 乐播兼容镜像 · Lelink 免密码镜像", 11, MUTED, false), 8);
         scanStatus = text("尚未搜索接收设备", 12, MUTED, false); add(root, scanStatus, 18);
         deviceList = new LinearLayout(this); deviceList.setOrientation(LinearLayout.VERTICAL); add(root, deviceList, 8);
         modes = new RadioGroup(this); modes.setOrientation(LinearLayout.HORIZONTAL);
@@ -101,7 +101,7 @@ public final class MainActivity extends Activity {
         }
         renderDevices();
         if (!devices.isEmpty() || !lelinkDevices.isEmpty()) {
-            scanStatus.setText("已发现 " + devices.size() + " 个 DLNA、" + lelinkDevices.size() + " 个乐播兼容镜像接收端");
+            scanStatus.setText("已发现 " + devices.size() + " 个 DLNA、" + lelinkDevices.size() + " 个乐联接收端");
         } else if (!otherServices.isEmpty()) scanStatus.setText("已发现其他投屏服务");
         updateMedia(); updateNetwork();
         if (bundle == null && retained == null) root.post(this::scan);
@@ -118,7 +118,7 @@ public final class MainActivity extends Activity {
         }
     }
     private void showHelp() {
-        new AlertDialog.Builder(this).setTitle("连接中国电信机顶盒").setMessage("手机与机顶盒连接同一 Wi-Fi，打开机顶盒已有的投屏服务。选择接收设备，点击开始屏幕投屏，并同意系统录屏授权。\n\nDLNA 投屏默认采集系统播放声音，不录制麦克风。若低延迟模式不出画面，结束后切换兼容模式。画面延迟取决于接收端播放器。\n\n乐播兼容镜像使用接收端的 AirPlay 兼容接口，不是完整 Lelink 协议。视频使用 H.264，音频在接收端广播兼容能力时默认启用，只采集系统播放声音、不录制麦克风。未发现兼容音频能力时会确认仅投画面；音频连接失败时会明确提示并停止。使用已保存的分辨率、帧率和码率，不改变 DLNA 的编码选择。不绕过接收端的收费、授权或时长限制。\n\n受保护内容可能黑屏或无声。\n\n使用 AirSonic 的录屏编码与 TS 封装组件，Copyright © 2026 Chunguang Wei，PolyForm Noncommercial 1.0.0 许可，仅限非商业用途。").setPositiveButton("知道了", null).setNeutralButton("系统无线投屏", (d,w) -> openMirror()).show();
+        new AlertDialog.Builder(this).setTitle("连接中国电信机顶盒").setMessage("手机与机顶盒连接同一 Wi-Fi，打开机顶盒已有的投屏服务。选择接收设备，点击开始屏幕投屏，并同意系统录屏授权。\n\nDLNA 投屏默认采集系统播放声音，不录制麦克风。若低延迟模式不出画面，结束后切换兼容模式。画面延迟取决于接收端播放器。\n\n乐播兼容镜像使用接收端的 AirPlay 兼容接口，不是完整 Lelink 协议。支持 H.264 / H.265，音频在接收端广播兼容能力时默认启用。未发现兼容音频能力时会确认仅投画面；音频连接失败时会明确提示并停止。\n\nLelink 免密码镜像是实验性的原生协议分支，仅在接收端明确广播免密码模式时提供入口。不实现验证码或密码分支，不会自动回退兼容镜像。默认传送系统声音，不依赖 AirPlay 音频能力广播；只在可信局域网使用。\n\n两种镜像均使用已保存的分辨率、帧率、码率和 H.264 / H.265 选择，不录制麦克风，不绕过接收端的收费、授权或时长限制。受保护内容可能黑屏或无声。\n\n使用 AirSonic 的录屏编码与 TS 封装组件，Copyright © 2026 Chunguang Wei，PolyForm Noncommercial 1.0.0 许可，仅限非商业用途。").setPositiveButton("知道了", null).setNeutralButton("系统无线投屏", (d,w) -> openMirror()).show();
     }
     private void updateNetwork() {
         ConnectivityManager manager = getSystemService(ConnectivityManager.class);
@@ -192,7 +192,7 @@ public final class MainActivity extends Activity {
             runOnUiThread(() -> {
                 if (destroyed || generation != scanGeneration) return;
                 scanStatus.setText(result != null ? "搜索失败：" + result : devices.isEmpty() ? "未发现 DLNA，正在继续检测其他投屏协议。" : "已发现 " + devices.size() + " 个 DLNA 接收端，请选择设备");
-                mainHandler.postDelayed(() -> { if (!destroyed && generation == scanGeneration && devices.isEmpty()) scanStatus.setText(otherServices.isEmpty() && lelinkDevices.isEmpty() ? "未发现接收端，请确认机顶盒投屏服务已打开。" : "未发现 DLNA，可尝试已发现的乐播兼容镜像接收端。" ); }, 6500);
+                mainHandler.postDelayed(() -> { if (!destroyed && generation == scanGeneration && devices.isEmpty()) scanStatus.setText(otherServices.isEmpty() && lelinkDevices.isEmpty() ? "未发现接收端，请确认机顶盒投屏服务已打开。" : "未发现 DLNA，可选择已发现的其他镜像接收端。" ); }, 6500);
             });
         });
     }
@@ -208,10 +208,56 @@ public final class MainActivity extends Activity {
             TextView row = text(description, 12, MUTED, false); row.setPadding(dp(12), dp(12), dp(12), dp(12)); row.setBackground(background(Color.WHITE, LINE, 5)); add(deviceList, row, 7);
         }
         for (LelinkEndpoint endpoint : lelinkDevices.values()) {
+            if (endpoint.advertisesFreeNativePairing()) {
+                Button nativeRow = button(endpoint.title() + "\nLelink 免密码镜像 · 开始投屏", false);
+                nativeRow.setEnabled(!castingBusy());
+                nativeRow.setOnClickListener(v -> prepareNativeMirror(endpoint)); add(deviceList, nativeRow, 7);
+            }
             Button row = button(endpoint.title() + "\n乐播兼容镜像 · 开始投屏", false);
             row.setEnabled(!castingBusy());
             row.setOnClickListener(v -> prepareCompatibleMirror(endpoint)); add(deviceList, row, 7);
         }
+    }
+    private void prepareNativeMirror(LelinkEndpoint endpoint) {
+        if (castingBusy()) return;
+        if (!endpoint.advertisesFreeNativePairing()) {
+            Toast.makeText(this, "接收端未声明免密码 Lelink 模式", Toast.LENGTH_LONG).show();
+            return;
+        }
+        ConnectivityManager manager = getSystemService(ConnectivityManager.class);
+        boolean wifi = false;
+        for (Network network : manager.getAllNetworks()) {
+            NetworkCapabilities caps = manager.getNetworkCapabilities(network);
+            if (caps != null && caps.hasTransport(NetworkCapabilities.TRANSPORT_WIFI)) { wifi = true; break; }
+        }
+        if (!wifi) { Toast.makeText(this, "请连接 Wi-Fi", Toast.LENGTH_SHORT).show(); return; }
+        CastQuality nativeQuality = quality;
+        SharedPreferences preferences = getSharedPreferences("cast", MODE_PRIVATE);
+        if (preferences.getBoolean("lelinkFreeMirrorNotice", false)) {
+            requestNativeMirror(endpoint, nativeQuality);
+            return;
+        }
+        showCompatibilityDialog(new AlertDialog.Builder(this).setTitle("Lelink 免密码镜像 · 实验")
+            .setMessage("仅连接接收端明确允许的免密码、无需验证码分支。开始前仍需系统录屏授权；接收端要求密码或验证码时会停止，不会自动回退其他协议。\n\n默认采集系统播放声音，不录制麦克风。不是完整 Lelink 协议，不绕过接收端的收费、授权或时长限制。请仅在可信局域网使用。\n\n本次画质：" + nativeQuality.summary())
+            .setNegativeButton("取消", null).setPositiveButton("开始投屏", (d,w) -> {
+                preferences.edit().putBoolean("lelinkFreeMirrorNotice", true).apply();
+                requestNativeMirror(endpoint, nativeQuality);
+            }).create());
+    }
+    private void requestNativeMirror(LelinkEndpoint endpoint, CastQuality nativeQuality) {
+        if (castingBusy()) return;
+        if (!endpoint.advertisesFreeNativePairing()) {
+            Toast.makeText(this, "接收端未声明免密码 Lelink 模式", Toast.LENGTH_LONG).show();
+            return;
+        }
+        compatibilityRequest = LegacyMirrorService.startIntent(this, endpoint, nativeQuality, true)
+                .putExtra("audioEligible", true).putExtra("audioRate", 44100);
+        updateMedia();
+        if (checkSelfPermission(Manifest.permission.RECORD_AUDIO) != android.content.pm.PackageManager.PERMISSION_GRANTED) {
+            requestPermissions(new String[]{Manifest.permission.RECORD_AUDIO}, 21);
+            return;
+        }
+        requestCompatibleProjection();
     }
     private void prepareCompatibleMirror(LelinkEndpoint endpoint) {
         if (castingBusy()) return;
@@ -358,7 +404,7 @@ public final class MainActivity extends Activity {
         MediaService.State state = MediaService.state;
         boolean active = state.active() || MirrorService.active || LegacyMirrorService.active;
         boolean busy = castingBusy();
-        mirrorNote.setText(LegacyMirrorService.active ? "乐播兼容镜像 · " + LegacyMirrorService.details : "系统声音已开启 · 不录制麦克风");
+        mirrorNote.setText(LegacyMirrorService.active ? LegacyMirrorService.routeLabel + " · " + LegacyMirrorService.details : "系统声音已开启 · 不录制麦克风");
         mediaStatus.setText(MirrorService.active || (!MirrorService.status.isEmpty() && !state.active()) ? MirrorService.deviceName + "\n" + MirrorService.status : state.status().isEmpty() ? "尚未开始投屏" : state.title() + "\n" + state.device() + " · " + state.status());
         if (LegacyMirrorService.active || (!LegacyMirrorService.status.isEmpty() && !MirrorService.active && !state.active())) mediaStatus.setText(LegacyMirrorService.status);
         mirrorButton.setEnabled(selected != null && !busy); chooseButton.setEnabled(selected != null && !busy); scanButton.setEnabled(!busy && !scanning); pauseButton.setEnabled(state.active()); stopButton.setEnabled(active); pauseButton.setText(state.paused() ? "继续播放" : "暂停");
@@ -384,13 +430,13 @@ public final class MainActivity extends Activity {
         Spinner codec = new Spinner(this);
         codec.setAdapter(new ArrayAdapter<>(this, android.R.layout.simple_spinner_dropdown_item, new String[]{"H.264 / AVC", "H.265 / HEVC"}));
         codec.setSelection(quality.codec() == VideoCodec.H265 ? 1 : 0); add(content, codec, 8);
-        add(content, text("H.265 需手机硬件编码器和接收端同时支持。乐播兼容镜像仅使用 H.264，不改变此处选择。", 11, MUTED, false), 6);
+        add(content, text("H.264 / H.265 选择适用于 DLNA、兼容镜像和 Lelink 免密码镜像。H.265 需手机硬件编码器与接收端同时支持。", 11, MUTED, false), 6);
         add(content, text("分辨率", 13, DARK, true), 8);
         Spinner resolution = new Spinner(this);
         resolution.setAdapter(new ArrayAdapter<>(this, android.R.layout.simple_spinner_dropdown_item, new String[]{"360p · 最大 640 × 360", "540p · 最大 960 × 540", "720p · 最大 1280 × 720", "1080p · 最大 1920 × 1080"}));
         for (int i=0; i<CastQuality.HEIGHTS.length; i++) if (CastQuality.HEIGHTS[i] == quality.height()) resolution.setSelection(i);
         add(content, resolution, 8);
-        add(content, text("乐播兼容镜像保持屏幕比例，竖屏时宽高互换。", 11, MUTED, false), 6);
+        add(content, text("兼容镜像与 Lelink 镜像保持屏幕比例，竖屏时宽高互换。", 11, MUTED, false), 6);
         add(content, text("帧率", 13, DARK, true), 16);
         Spinner rate = new Spinner(this); rate.setAdapter(new ArrayAdapter<>(this, android.R.layout.simple_spinner_dropdown_item, new String[]{"15 fps", "20 fps", "25 fps", "30 fps", "60 fps"}));
         for (int i=0; i<CastQuality.FRAME_RATES.length; i++) if (CastQuality.FRAME_RATES[i] == quality.fps()) rate.setSelection(i);

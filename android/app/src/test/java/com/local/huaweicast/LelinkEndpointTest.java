@@ -124,4 +124,18 @@ public class LelinkEndpointTest {
         assertEquals(first.key(), duplicate.key());
         assertNotEquals(first.key(), otherPort.key());
     }
+
+    @Test public void nativeFreePairingRequiresExplicitPortAndBothModeFields() throws Exception {
+        assertTrue(endpoint(txt("lelinkport", "52244", "htv", "1", "atv", "0")).advertisesFreeNativePairing());
+        assertTrue(endpoint(txt("LELINKPORT", "52244", "HTV", "1", "ATV", "0")).advertisesFreeNativePairing());
+        assertFalse(endpoint(txt("remote", "52244", "htv", "1", "atv", "0")).advertisesFreeNativePairing());
+        assertFalse(endpoint(txt("lelinkport", "52244", "atv", "0")).advertisesFreeNativePairing());
+        assertFalse(endpoint(txt("lelinkport", "52244", "htv", "1")).advertisesFreeNativePairing());
+        for (String mode : new String[]{"0", "1", "2", "3", "", "00"}) {
+            assertFalse(endpoint(txt("lelinkport", "52244", "htv", "2", "atv", mode)).advertisesFreeNativePairing());
+        }
+        for (String mode : new String[]{"1", "2", "3", "", "00"}) {
+            assertFalse(endpoint(txt("lelinkport", "52244", "htv", "1", "atv", mode)).advertisesFreeNativePairing());
+        }
+    }
 }

@@ -23,28 +23,37 @@ import java.util.concurrent.Executors
 import java.util.concurrent.CompletableFuture
 import java.util.concurrent.TimeUnit
 
-/** Continuous mirroring over receivers' legacy AirPlay compatibility channels. */
+/** Shared capture lifecycle for native Lelink and legacy compatibility mirroring. */
 class LegacyMirrorService : Service() {
     companion object {
         @JvmField @Volatile var active = false
         @JvmField @Volatile var status = ""
         @JvmField @Volatile var details = ""
+        @JvmField @Volatile var routeLabel = "乐播兼容镜像"
         @JvmStatic fun startIntent(context: Context, endpoint: LelinkEndpoint, quality: CastQuality): Intent =
-            Intent(context, LegacyMirrorService::class.java)
+            startIntent(context, endpoint, quality, false)
+        @JvmStatic fun startIntent(context: Context, endpoint: LelinkEndpoint, quality: CastQuality, nativeLelink: Boolean): Intent {
+            require(!nativeLelink || endpoint.advertisesFreeNativePairing()) { "接收端未声明免密码 Lelink 模式" }
+            return Intent(context, LegacyMirrorService::class.java)
                 .putExtra("name", endpoint.name()).putExtra("host", endpoint.address().hostAddress)
                 .putExtra("control", endpoint.controlPort()).putExtra("mirror", endpoint.mirrorPort().orElse(0))
                 .putExtra("raop", endpoint.raopPort().orElse(0))
+                .putExtra("nativeLelink", nativeLelink)
+                .putExtra("lelink", if (endpoint.advertisesFreeNativePairing()) endpoint.controlPort() else 0)
+                .putExtra("htv", endpoint.metadata()["htv"]).putExtra("atv", endpoint.metadata()["atv"])
                 .putExtra("height", quality.height()).putExtra("fps", quality.fps()).putExtra("kbps", quality.kbps())
                 .putExtra("codec", quality.codec().id())
+        }
     }
 
     private val main = Handler(Looper.getMainLooper())
     private val worker = Executors.newSingleThreadExecutor()
     @Volatile private var stopping = false
-    @Volatile private var client: LegacyMirrorClient? = null
+    @Volatile private var client: MirrorVideoTransport? = null
     @Volatile private var caster: ScreenMirrorCaster? = null
     @Volatile private var lastFrameAt = 0L
     @Volatile private var audioClient: RaopAudioClient? = null
+    @Volatile private var audioEncryptor: LelinkMediaWire.AudioEncryptor? = null
     @Volatile private var audioCapture: PlaybackAudioCapture? = null
     @Volatile private var audioReady = false
     @Volatile private var lastAudioFrameAt = 0L
@@ -102,11 +111,13 @@ class LegacyMirrorService : Service() {
         if (intent == null || intent.action == "stop") { finish("投屏已停止"); return START_NOT_STICKY }
         if (active || stopping) return START_NOT_STICKY
         active = true
+        val nativeLelink = intent.getBooleanExtra("nativeLelink", false)
+        routeLabel = if (nativeLelink) "Lelink 免密码镜像" else "乐播兼容镜像"
         receiverName = intent.getStringExtra("name") ?: ""
         quality = CastQuality(intent.getIntExtra("height", 540), intent.getIntExtra("fps", 20),
             intent.getIntExtra("kbps", 1200), VideoCodec.fromId(intent.getStringExtra("codec")))
         details = "${quality.codec().label()} · 仅画面"
-        val withAudio = intent.getBooleanExtra("audioEligible", false)
+        val withAudio = nativeLelink || intent.getBooleanExtra("audioEligible", false)
         audioStatus = if (withAudio) "正在连接系统声音" else "仅画面：" +
             (intent.getStringExtra("audioUnavailableReason") ?: "接收端未声明兼容音频能力")
         startedAt = SystemClock.elapsedRealtime()
@@ -134,15 +145,19 @@ class LegacyMirrorService : Service() {
             renewWakeAt = SystemClock.elapsedRealtime() + 60000
             val host = intent.getStringExtra("host") ?: error("缺少接收端")
             require(InetAddresses.isNumericAddress(host)) { "无效接收地址" }
-            val ports = mutableMapOf("mirror" to intent.getIntExtra("mirror", 0).toString().toByteArray(StandardCharsets.US_ASCII))
+            val ports = mutableMapOf<String, ByteArray>()
+            if (intent.getIntExtra("mirror", 0) > 0) ports["mirror"] = intent.getIntExtra("mirror", 0).toString().toByteArray(StandardCharsets.US_ASCII)
             if (intent.getIntExtra("raop", 0) > 0) ports["raop"] = intent.getIntExtra("raop", 0).toString().toByteArray(StandardCharsets.US_ASCII)
+            if (intent.getIntExtra("lelink", 0) > 0) ports["lelinkport"] = intent.getIntExtra("lelink", 0).toString().toByteArray(StandardCharsets.US_ASCII)
+            for (key in listOf("htv", "atv")) intent.getStringExtra(key)?.let { ports[key] = it.toByteArray(StandardCharsets.UTF_8) }
             val endpoint = LelinkEndpoint.from(receiverName, InetAddresses.parseNumericAddress(host), intent.getIntExtra("control", 0), ports)
+            require(!nativeLelink || endpoint.advertisesFreeNativePairing()) { "接收端未声明免密码 Lelink 模式，连接已停止" }
             val source = sourceSize()
             desiredSize = source
             val size = encodingSize(source)
             dimensions = size
             updateDetails(size)
-            publish("正在连接乐播兼容镜像…")
+            publish("正在连接$routeLabel…")
             worker.execute {
                 try {
                     if (stopping) return@execute
@@ -153,8 +168,17 @@ class LegacyMirrorService : Service() {
                     }
                     var latencyMs = 90
                     var mirrorEndpoint = endpoint
+                    val nativeTransport = if (nativeLelink) {
+                        LelinkMirrorClient(size.width(), size.height(), { caster?.requestSyncFrame() },
+                            { message -> main.post { finish(message) } }, session, quality.codec()).also { transport ->
+                            client = transport
+                            if (stopping) { transport.close(); return@execute }
+                            transport.connect(endpoint, binder)
+                            if (stopping) return@execute
+                        }
+                    } else null
                     if (withAudio) {
-                        check(endpoint.raopPort().isPresent) { "接收端未广播音频端口" }
+                        if (!nativeLelink) check(endpoint.raopPort().isPresent) { "接收端未广播音频端口" }
                         val rate = intent.getIntExtra("audioRate", 44100)
                         val configured = CompletableFuture<ByteArray>()
                         audioConfiguration = configured
@@ -179,7 +203,16 @@ class LegacyMirrorService : Service() {
                             { message -> main.post { finish("音频连接已结束：$message") } }, quality.codec())
                         audioClient = audio
                         if (stopping) { audio.close(); return@execute }
-                        audio.connect(endpoint.address(), endpoint.raopPort().asInt, binder)
+                        if (nativeTransport != null) {
+                            val seed = nativeTransport.mediaSeed()
+                            val encryptor = try { LelinkMediaWire.AudioEncryptor(seed) } finally { seed.fill(0) }
+                            audioEncryptor = encryptor
+                            if (stopping) return@execute
+                            audio.connectNative(endpoint.address(), binder,
+                                { control, timing -> nativeTransport.setupAudio(rate, control, timing) }, encryptor::encryptPayload)
+                        } else {
+                            audio.connect(endpoint.address(), endpoint.raopPort().asInt, binder)
+                        }
                         if (stopping) return@execute
                         android.util.Log.i("HuaweiCastLegacy", "Audio negotiated: ${audio.description()}, mirrorPort=${audio.negotiatedMirrorPort().orElse(0)}")
                         latencyMs = audio.latencyMs()
@@ -191,18 +224,23 @@ class LegacyMirrorService : Service() {
                         audioReady = true
                         main.post { if (!stopping) { audioStatus = "系统声音 · AAC-ELD"; updateDetails(size) } }
                     }
-                    val transport = LegacyMirrorClient(size.width(), size.height(), { caster?.requestSyncFrame() },
-                        { message -> main.post { finish(message) } }, session, latencyMs, audioReady, quality.codec())
-                    client = transport
-                    if (stopping) { transport.close(); return@execute }
-                    transport.connect(mirrorEndpoint, binder)
+                    val transport: MirrorVideoTransport = nativeTransport ?: LegacyMirrorClient(size.width(), size.height(), { caster?.requestSyncFrame() },
+                        { message -> main.post { finish(message) } }, session, latencyMs, audioReady, quality.codec()).also {
+                        client = it
+                        if (stopping) { it.close(); return@execute }
+                        it.connect(mirrorEndpoint, binder)
+                    }
                     if (stopping) return@execute
                     val encoder = ScreenMirrorCaster(width = size.width(), height = size.height(), dpi = resources.displayMetrics.densityDpi,
                         bitRate = quality.bitRate(), frameRate = quality.fps(), videoCodec = quality.codec(),
-                        emit = { true }, onCodecConfig = transport::configure,
+                        emit = { true }, onCodecConfig = { sps, pps ->
+                            runCatching { transport.configure(sps, pps) }.onFailure { error ->
+                                main.post { finish("H.264 参数集不适合$routeLabel：${error.message}") }
+                            }
+                        },
                         onHevcCodecConfig = { vps, sps, pps ->
                             runCatching { transport.configureHevc(vps, sps, pps) }.onFailure { error ->
-                                main.post { finish("H.265 参数集不适合兼容镜像，请切换 H.264：${error.message}") }
+                                main.post { finish("H.265 参数集不适合$routeLabel，请切换 H.264：${error.message}") }
                             }
                         },
                         onCapturedVideoFrame = { bytes, pts, key ->
@@ -229,7 +267,7 @@ class LegacyMirrorService : Service() {
         val open = PendingIntent.getActivity(this, 3, Intent(this, MainActivity::class.java),
             PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE)
         return Notification.Builder(this, "mirror-compat").setSmallIcon(R.drawable.ic_cast)
-            .setContentTitle("乐播兼容镜像 · $receiverName").setContentText(message).setContentIntent(open)
+            .setContentTitle("$routeLabel · $receiverName").setContentText(message).setContentIntent(open)
             .setOngoing(true).addAction(Notification.Action.Builder(null, "停止投屏", stop).build()).build()
     }
     @Suppress("DEPRECATION")
@@ -342,6 +380,7 @@ class LegacyMirrorService : Service() {
         networkRegistered = false; displayRegistered = false
         worker.execute {
             runCatching { audioCapture?.stop() }; audioCapture = null
+            runCatching { audioEncryptor?.close() }; audioEncryptor = null
             runCatching { caster?.stop() }; caster = null
             projection?.let { runCatching { it.unregisterCallback(projectionCallback) }; runCatching { it.stop() } }; projection = null
             runCatching { wifiLock?.let { if (it.isHeld) it.release() } }; wifiLock = null

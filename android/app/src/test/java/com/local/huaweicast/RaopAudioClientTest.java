@@ -10,6 +10,7 @@ import java.util.*;
 import java.util.concurrent.*;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.function.BooleanSupplier;
+import java.util.function.UnaryOperator;
 
 public class RaopAudioClientTest {
     private static final byte[] CONFIG = {(byte) 0xf8, (byte) 0xe8, 0x40, 0};
@@ -68,6 +69,216 @@ public class RaopAudioClientTest {
     @Test public void explicitVideoCodecCannotBeNull() {
         try { new RaopAudioClient(LegacyMirrorSession.create(), 44100, 512, CONFIG, ignored -> {}, (VideoCodec) null); fail(); }
         catch (NullPointerException expected) { assertTrue(expected.getMessage().contains("video codec")); }
+    }
+
+    @Test public void nativeSetupBindsAllUdpSocketsWithoutLegacyControlRequests() throws Exception {
+        try (Fixture f = new Fixture()) {
+            AtomicInteger negotiations = new AtomicInteger();
+            f.connectNative((controlPort, timingPort) -> {
+                assertEquals(3, f.udps.size());
+                assertEquals(3, f.bindings.get());
+                assertEquals(f.udps.get(1).getLocalPort(), controlPort);
+                assertEquals(f.udps.get(2).getLocalPort(), timingPort);
+                for (FakeUdp udp : f.udps) { assertTrue(udp.bound); assertEquals(0, udp.getPort()); }
+                negotiations.incrementAndGet();
+                return new RaopAudioClient.NativePorts(6000, 6001, 6002);
+            }, UnaryOperator.identity());
+            assertEquals(1, negotiations.get());
+            assertEquals(0, f.tcpAllocations.get());
+            assertTrue(f.tcp.requests.isEmpty());
+            assertFalse(f.client.negotiatedMirrorPort().isPresent());
+            assertEquals(100, f.client.latencyMs());
+            assertEquals(6000, f.udps.get(0).getPort());
+            assertEquals(6001, f.udps.get(1).getPort());
+            assertEquals(6002, f.udps.get(2).getPort());
+            f.client.close(); f.client.close();
+            for (FakeUdp udp : f.udps) assertTrue(udp.closed);
+            assertTrue(f.tcp.requests.isEmpty());
+            assertEquals(0, f.failures.get());
+        }
+    }
+
+    @Test public void nativeEncryptionPreservesSampleClockAndResendsIdenticalCiphertext() throws Exception {
+        try (Fixture f = new Fixture(44100, 480, new byte[]{(byte) 0xf8, (byte) 0xe8, 0x50, 0})) {
+            AtomicInteger encryptions = new AtomicInteger();
+            f.connectNative((controlPort, timingPort) -> new RaopAudioClient.NativePorts(6000, 6001, 6002), raw -> {
+                int nonce = encryptions.incrementAndGet();
+                for (int i = 0; i < raw.length; i++) raw[i] ^= (byte) (0x60 + nonce);
+                return raw;
+            });
+            long pts = System.nanoTime() / 1000;
+            f.client.offer(AAC, pts); f.client.offer(AAC, pts + 1);
+            await(() -> f.client.sentFrames() == 2);
+            byte[] first = f.udps.get(0).sent.get(0), second = f.udps.get(0).sent.get(1);
+            assertArrayEquals(new byte[]{0x60, 0x63, 0x62, 0x65}, Arrays.copyOfRange(first, 12, first.length));
+            assertArrayEquals(new byte[]{0x63, 0x60, 0x61, 0x66}, Arrays.copyOfRange(second, 12, second.length));
+            assertArrayEquals(new byte[]{1, 2, 3, 4}, AAC);
+            ByteBuffer a = ByteBuffer.wrap(first), b = ByteBuffer.wrap(second);
+            assertEquals(480, (b.getInt(4) - a.getInt(4)) & 0xffffffffL);
+            assertEquals(0xe0, first[1] & 255); assertEquals(0x60, second[1] & 255);
+            byte[] sync = f.udps.get(1).sent.get(0);
+            assertEquals(RaopAudioWire.ntpTimestampUs(f.session.relativeUs(pts)), ByteBuffer.wrap(sync).getLong(8));
+            assertEquals((a.getInt(4) - 4410L) & 0xffffffffL, ByteBuffer.wrap(sync).getInt(4) & 0xffffffffL);
+            int sequence = a.getShort(2) & 65535;
+            byte[] request = ByteBuffer.allocate(8).put((byte) 0x80).put((byte) 0xd5).putShort((short) 9)
+                    .putShort((short) sequence).putShort((short) 1).array();
+            f.udps.get(1).inject(request, PEER, 6001);
+            await(() -> f.client.resentFrames() == 1);
+            byte[] reply = f.udps.get(1).sent.get(1);
+            assertArrayEquals(first, Arrays.copyOfRange(reply, 4, reply.length));
+            assertEquals(2, encryptions.get());
+            assertEquals(0, f.tcpAllocations.get());
+        }
+    }
+
+    @Test public void nativeTimingStillValidatesNegotiatedPeerAndPort() throws Exception {
+        try (Fixture f = new Fixture()) {
+            f.connectNative((controlPort, timingPort) -> new RaopAudioClient.NativePorts(6000, 6001, 6002), UnaryOperator.identity());
+            FakeUdp timing = f.udps.get(2);
+            byte[] request = RaopAudioWire.timingRequest(12, 34);
+            timing.inject(request, InetAddress.getByName("192.168.71.8"), 6002);
+            timing.inject(request, PEER, 6003);
+            timing.inject(request, PEER, 6002);
+            await(() -> f.client.timingReplies() == 1);
+            assertEquals(1, timing.sent.size());
+            assertEquals(34, RaopAudioWire.parseTimingReply(timing.sent.get(0)).originNtp());
+        }
+    }
+
+    @Test public void nativeTimingAlsoAnswersOnlyValidNtpV4ClientRequests() throws Exception {
+        try (Fixture f = new Fixture()) {
+            f.connectNative((controlPort, timingPort) -> new RaopAudioClient.NativePorts(6000, 6001, 6002), UnaryOperator.identity());
+            FakeUdp timing = f.udps.get(2);
+            byte[] request = new byte[48]; request[0] = 0x23;
+            ByteBuffer.wrap(request).putLong(40, 0x123456789abcdefL);
+            timing.inject(request, InetAddress.getByName("192.168.71.8"), 6002);
+            timing.inject(request, PEER, 6003);
+            for (int firstByte : new int[]{0, 0x1b, 0x24, 0x22}) {
+                byte[] invalid = request.clone(); invalid[0] = (byte) firstByte;
+                timing.inject(invalid, PEER, 6002);
+            }
+            timing.inject(Arrays.copyOf(request, 47), PEER, 6002);
+            timing.inject(Arrays.copyOf(request, 49), PEER, 6002);
+            timing.inject(request, PEER, 6002);
+            await(() -> f.client.timingReplies() == 1);
+            assertEquals(1, timing.sent.size());
+            byte[] reply = timing.sent.get(0);
+            assertEquals(48, reply.length); assertEquals(0x24, reply[0]);
+            ByteBuffer fields = ByteBuffer.wrap(reply);
+            assertEquals(0x123456789abcdefL, fields.getLong(24));
+            assertTrue(Long.compareUnsigned(fields.getLong(40), fields.getLong(32)) >= 0);
+            assertEquals(0, f.failures.get());
+        }
+    }
+
+    @Test public void legacyTimingIgnoresNativeNtpWithoutAProtocolFallback() throws Exception {
+        try (Fixture f = new Fixture()) {
+            f.connect();
+            FakeUdp timing = f.udps.get(2);
+            byte[] nativeRequest = new byte[48]; nativeRequest[0] = 0x23;
+            timing.inject(nativeRequest, PEER, 6002);
+            timing.inject(RaopAudioWire.timingRequest(12, 34), PEER, 6002);
+            await(() -> f.client.timingReplies() == 1);
+            assertEquals(1, timing.sent.size());
+            assertEquals(32, timing.sent.get(0).length);
+            assertEquals(34, RaopAudioWire.parseTimingReply(timing.sent.get(0)).originNtp());
+        }
+    }
+
+    @Test public void nativeEndpointValidationPrecedesSocketAllocationAndSetup() throws Exception {
+        for (String address : new String[]{"0.0.0.0", "127.0.0.1", "8.8.8.8", "224.0.0.1"}) {
+            try (Fixture f = new Fixture()) {
+                try {
+                    f.client.connectNative(InetAddress.getByName(address), f.binder(), (controlPort, timingPort) -> {
+                        fail("Invalid peer must not negotiate"); return null;
+                    }, UnaryOperator.identity());
+                    fail();
+                } catch (IOException expected) {}
+                assertTrue(f.udps.isEmpty()); assertEquals(0, f.tcpAllocations.get());
+            }
+        }
+    }
+
+    @Test public void nativeInvalidNegotiatedPortsCloseEveryUdpWithoutSending() throws Exception {
+        for (RaopAudioClient.NativePorts ports : new RaopAudioClient.NativePorts[]{null,
+                new RaopAudioClient.NativePorts(0, 6001, 6002), new RaopAudioClient.NativePorts(65536, 6001, 6002),
+                new RaopAudioClient.NativePorts(6000, -1, 6002), new RaopAudioClient.NativePorts(6000, 65536, 6002),
+                new RaopAudioClient.NativePorts(6000, 6001, 0), new RaopAudioClient.NativePorts(6000, 6001, 65536)}) {
+            try (Fixture f = new Fixture()) {
+                try { f.connectNative((controlPort, timingPort) -> ports, UnaryOperator.identity()); fail(); }
+                catch (IOException expected) { assertTrue(expected.getMessage().contains("端口")); }
+                assertEquals(3, f.udps.size());
+                for (FakeUdp udp : f.udps) { assertTrue(udp.closed); assertTrue(udp.sent.isEmpty()); }
+                assertEquals(0, f.tcpAllocations.get()); assertEquals(0, f.failures.get());
+            }
+        }
+    }
+
+    @Test public void nativeSetupFailureDoesNotRetryOrOpenLegacyControl() throws Exception {
+        try (Fixture f = new Fixture()) {
+            AtomicInteger negotiations = new AtomicInteger();
+            try {
+                f.connectNative((controlPort, timingPort) -> {
+                    negotiations.incrementAndGet(); throw new RaopAudioClient.AuthorizationRequiredException();
+                }, UnaryOperator.identity());
+                fail();
+            } catch (RaopAudioClient.AuthorizationRequiredException expected) {}
+            assertEquals(1, negotiations.get()); assertEquals(0, f.tcpAllocations.get());
+            for (FakeUdp udp : f.udps) assertTrue(udp.closed);
+            assertEquals(0, f.failures.get());
+        }
+    }
+
+    @Test public void nativeCancellationDuringNegotiationCannotRestartClosedSockets() throws Exception {
+        try (Fixture f = new Fixture()) {
+            CountDownLatch entered = new CountDownLatch(1), release = new CountDownLatch(1);
+            ExecutorService worker = Executors.newSingleThreadExecutor();
+            try {
+                Future<?> connect = worker.submit(() -> {
+                    try {
+                        f.connectNative((controlPort, timingPort) -> {
+                            entered.countDown();
+                            try { if (!release.await(1, TimeUnit.SECONDS)) throw new IOException("Timed out waiting for cancellation"); }
+                            catch (InterruptedException error) { Thread.currentThread().interrupt(); throw new IOException(error); }
+                            return new RaopAudioClient.NativePorts(6000, 6001, 6002);
+                        }, UnaryOperator.identity());
+                        fail("Cancelled setup must fail");
+                    } catch (IOException expected) {}
+                });
+                assertTrue(entered.await(1, TimeUnit.SECONDS));
+                f.client.close(); release.countDown(); connect.get(1, TimeUnit.SECONDS);
+                for (FakeUdp udp : f.udps) { assertTrue(udp.closed); assertTrue(udp.sent.isEmpty()); }
+                assertEquals(0, f.tcpAllocations.get()); assertEquals(0, f.failures.get());
+            } finally { release.countDown(); worker.shutdownNow(); }
+        }
+    }
+
+    @Test public void nativeCancellationDuringUdpAllocationClosesUnassignedSocket() throws Exception {
+        try (Fixture f = new Fixture()) {
+            f.afterUdpAllocation = () -> { if (f.udps.size() == 2) f.client.close(); };
+            try {
+                f.connectNative((controlPort, timingPort) -> {
+                    fail("Cancelled allocation must not negotiate"); return null;
+                }, UnaryOperator.identity());
+                fail();
+            } catch (IOException expected) {}
+            assertEquals(2, f.udps.size());
+            for (FakeUdp udp : f.udps) assertTrue(udp.closed);
+            assertEquals(0, f.tcpAllocations.get()); assertEquals(0, f.failures.get());
+        }
+    }
+
+    @Test public void nativeInvalidEncryptionStopsWithoutSendingPlaintext() throws Exception {
+        for (byte[] encrypted : new byte[][]{null, new byte[0], new byte[8193]}) {
+            try (Fixture f = new Fixture()) {
+                f.connectNative((controlPort, timingPort) -> new RaopAudioClient.NativePorts(6000, 6001, 6002), raw -> encrypted);
+                f.client.offer(AAC, System.nanoTime() / 1000);
+                await(() -> f.failures.get() == 1);
+                assertTrue(f.message.contains("加密"));
+                assertTrue(f.udps.get(0).sent.isEmpty());
+                for (FakeUdp udp : f.udps) assertTrue(udp.closed);
+            }
+        }
     }
 
     @Test public void audioSetupAdvertisesActualSampleRateWithoutHardcoding44100() {
@@ -412,9 +623,10 @@ public class RaopAudioClientTest {
         final LegacyMirrorSession session = new LegacyMirrorSession(123, 456, System.nanoTime());
         final FakeTcp tcp = new FakeTcp();
         final List<FakeUdp> udps = new CopyOnWriteArrayList<>();
-        final AtomicInteger failures = new AtomicInteger(), bindings = new AtomicInteger();
+        final AtomicInteger failures = new AtomicInteger(), bindings = new AtomicInteger(), tcpAllocations = new AtomicInteger();
         final RaopAudioClient client;
         volatile String message;
+        Runnable afterUdpAllocation = () -> {};
         Fixture() { this(44100, 512, CONFIG); }
         Fixture(int sampleRate, int samplesPerFrame, byte[] config) {
             client = new RaopAudioClient(session, sampleRate, samplesPerFrame, config, value -> { message = value; failures.incrementAndGet(); }, socketFactory());
@@ -424,14 +636,20 @@ public class RaopAudioClientTest {
         }
         private RaopAudioClient.SocketFactory socketFactory() {
             return new RaopAudioClient.SocketFactory() {
-                public Socket tcp() { return tcp; }
-                public DatagramSocket udp() throws IOException { FakeUdp value = new FakeUdp(); udps.add(value); return value; }
+                public Socket tcp() { tcpAllocations.incrementAndGet(); return tcp; }
+                public DatagramSocket udp() throws IOException {
+                    FakeUdp value = new FakeUdp(); udps.add(value); afterUdpAllocation.run(); return value;
+                }
             };
         }
-        void connect() throws IOException { client.connect(PEER, 52244, new LegacyMirrorClient.Binder() {
+        LegacyMirrorClient.Binder binder() { return new LegacyMirrorClient.Binder() {
             public void bind(Socket socket) { bindings.incrementAndGet(); }
             public void bind(DatagramSocket socket) { bindings.incrementAndGet(); }
-        }); }
+        }; }
+        void connect() throws IOException { client.connect(PEER, 52244, binder()); }
+        void connectNative(RaopAudioClient.NativeSetup setup, UnaryOperator<byte[]> encrypt) throws IOException {
+            client.connectNative(PEER, binder(), setup, encrypt);
+        }
         public void close() { client.close(); }
     }
 
@@ -493,10 +711,10 @@ public class RaopAudioClientTest {
         final int localPort = NEXT_PORT.incrementAndGet();
         final List<byte[]> sent = new CopyOnWriteArrayList<>();
         final BlockingQueue<Incoming> incoming = new LinkedBlockingQueue<>();
-        volatile boolean closed;
+        volatile boolean closed, bound;
         int port;
         FakeUdp() throws SocketException { super((SocketAddress) null); }
-        public void bind(SocketAddress address) {}
+        public void bind(SocketAddress address) { bound = true; }
         public void setSoTimeout(int value) {}
         public void connect(InetAddress address, int port) { this.port = port; }
         public int getPort() { return port; }

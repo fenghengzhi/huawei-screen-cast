@@ -12,7 +12,7 @@ import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.function.Consumer;
 
 /** Legacy AirPlay compatibility transport, not a proprietary Lelink implementation. */
-public final class LegacyMirrorClient implements AutoCloseable {
+public final class LegacyMirrorClient implements MirrorVideoTransport {
     public interface Binder {
         void bind(Socket socket) throws IOException;
         void bind(DatagramSocket socket) throws IOException;
